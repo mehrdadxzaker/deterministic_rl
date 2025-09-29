@@ -259,7 +259,7 @@ class MultiMetricProgression:
 
     def set_for_query(self, q):
         if q['type']=='reachable':
-            return self.env.k_step_reachable(q['s'], q.get('k',3'))
+            return self.env.k_step_reachable(q['s'], q.get('k', 3))
         return set()
 
     def value_trace(self, s, plan:List[int]):
@@ -295,7 +295,14 @@ class MultiMetricProgression:
             rjac = 0.0
         lev = levenshtein(p1,p2)/max(1,max(len(p1),len(p2)))
         w=self.weights
-        score = w['lcs']*lcs + w['multiset']*mult + w['prefix']*pref + w['value_drift']*vdrift + w['reach_jaccard']*rjac + w['levenshtein']*lev
+        score = (
+            w['lcs'] * lcs
+            + w['multiset'] * mult
+            + w['prefix'] * pref
+            + w['value_drift'] * vdrift
+            + w['reach_jaccard'] * rjac
+            + w['levenshtein'] * lev
+        )
         return float(score)
 
     def order_queries_progressively(self, queries:List[Dict], anchor:Optional[Dict]=None):
