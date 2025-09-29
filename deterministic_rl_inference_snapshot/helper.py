@@ -354,7 +354,10 @@ class QDIN(nn.Module):
         self.R = nn.Parameter(torch.zeros(self.S, self.A))
         nn.init.xavier_uniform_(self.R)
 
-        self.readout = nn.Linear(hidden*3, hidden)
+        # The fusion layer consumes state/query embeddings along with scalar value
+        # and action-value features. The concatenated vector therefore has size
+        # ``hidden + hidden + 1 + A`` rather than ``hidden*3``.
+        self.readout = nn.Linear(hidden * 2 + self.A + 1, hidden)
 
         # Heads
         self.h_value = nn.Linear(hidden, 1)
