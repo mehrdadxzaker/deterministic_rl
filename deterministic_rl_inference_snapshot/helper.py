@@ -508,8 +508,10 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
         with torch.no_grad():
             # bootstrap from model's Q on s2
             qn = model({'type':'policy','s':s2})['policy']
-            y = r + 0.99 * (0.0 if done else torch.max(qn))
+            bootstrap = 0.0 if done else torch.max(qn).item()
+            y_val = r + 0.99 * bootstrap
         qsa = model({'type':'q','s':s,'a':a})['q'][a]
+        y = torch.tensor(y_val, device=qsa.device, dtype=qsa.dtype)
         loss_td = loss_td + F.mse_loss(qsa, y)
     loss_td = loss_td / max(1, bsz//2)
 
