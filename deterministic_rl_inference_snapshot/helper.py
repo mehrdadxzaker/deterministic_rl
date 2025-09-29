@@ -642,8 +642,24 @@ class ExperimentTracker:
         self.logs.append(kwargs)
     def summary(self):
         if not self.logs: return {}
-        keys=self.logs[0].keys()
-        return {k: float(np.mean([x[k] for x in self.logs if k in x])) for k in keys}
+        # aggregate over all keys observed across the logs
+        keys=set().union(*(entry.keys() for entry in self.logs))
+        summary={}
+        for k in keys:
+            values=[entry[k] for entry in self.logs if k in entry]
+            numeric=[]
+            for v in values:
+                if isinstance(v, (int, float, np.integer, np.floating)):
+                    numeric.append(float(v))
+                else:
+                    # keep track of non-numeric values to return a representative element
+                    numeric=None
+                    break
+            if numeric:
+                summary[k]=float(np.mean(numeric))
+            else:
+                summary[k]=values[-1]
+        return summary
 
 def build_default_env(seed=0):
     walls=[]
