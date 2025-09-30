@@ -15,14 +15,14 @@ def run_experiment_7_1(grid_size=8, n_obstacles=8, episodes=600, seed=0):
     # Train Q-DIN
     device='cuda' if torch.cuda.is_available() else 'cpu'
     qdin = QDIN(env).to(device)
-    opt = torch.optim.Adam(qdin.parameters(), lr=2e-3)
+    opt = torch.optim.Adam(qdin.parameters(), lr=5e-4)
     w = LossWeights(td=0.1, inf=1.0, explic=0.05)
 
     tracker = ExperimentTracker()
     for ep in range(episodes):
         batch = select_queries_active_coverage(env, mmp, (gt['V'],gt['Q']), batch_size=24)
         loss, parts = inference_aware_loss(qdin, env, batch, gt, w)
-        opt.zero_grad(); loss.backward(); opt.step()
+        opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(qdin.parameters(), 1.0); opt.step()
         if (ep+1)%100==0:
             # evaluate
             test_q = select_queries_active_coverage(env, mmp, (gt['V'],gt['Q']), batch_size=60)
@@ -38,9 +38,10 @@ def run_experiment_7_1(grid_size=8, n_obstacles=8, episodes=600, seed=0):
 
 def rollouts_return(env, policy_fn, n_episodes=10):
     tot=0.0
+    max_steps = 4 * env.cfg.H * env.cfg.W
     for _ in range(n_episodes):
         s=env.reset(); ret=0.0
-        for t in range(200):
+        for t in range(max_steps):
             if s==env.cfg.goal: break
             a=policy_fn(s)
             s,r,done,_=env.step(a)

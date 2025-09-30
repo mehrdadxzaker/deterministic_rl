@@ -12,15 +12,15 @@ def train_mode(env, mode:str, episodes:int=600, seed:int=0):
 
     if mode=="control-only":
         model = QDIN(env).to(device)
-        opt = torch.optim.Adam(model.parameters(), lr=2e-3)
+        opt = torch.optim.Adam(model.parameters(), lr=5e-4)
         w = LossWeights(td=1.0, inf=0.0, explic=0.0)
     elif mode=="query-only":
         model = QDIN(env).to(device)
-        opt = torch.optim.Adam(model.parameters(), lr=2e-3)
+        opt = torch.optim.Adam(model.parameters(), lr=5e-4)
         w = LossWeights(td=0.0, inf=1.0, explic=0.05)
     elif mode=="mixed":
         model = QDIN(env).to(device)
-        opt = torch.optim.Adam(model.parameters(), lr=2e-3)
+        opt = torch.optim.Adam(model.parameters(), lr=5e-4)
         w = LossWeights(td=0.1, inf=1.0, explic=0.05)
     else:
         raise ValueError("Unknown mode")
@@ -32,7 +32,7 @@ def train_mode(env, mode:str, episodes:int=600, seed:int=0):
     for ep in range(episodes):
         batch = select_queries_active_coverage(env, mmp, (gt['V'],gt['Q']), batch_size=24)
         loss, parts = inference_aware_loss(model, env, batch, gt, w)
-        opt.zero_grad(); loss.backward(); opt.step()
+        opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
 
         if (ep+1)%100==0:
             # inference metrics
@@ -47,9 +47,10 @@ def train_mode(env, mode:str, episodes:int=600, seed:int=0):
 
 def rollouts_return(env, policy_fn, n_episodes=10):
     tot=0.0
+    max_steps = 4 * env.cfg.H * env.cfg.W
     for _ in range(n_episodes):
         s=env.reset(); ret=0.0
-        for t in range(200):
+        for t in range(max_steps):
             if s==env.cfg.goal: break
             a=policy_fn(s)
             s,r,done,_=env.step(a)
