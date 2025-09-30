@@ -189,6 +189,79 @@ def make_comparative_queries(env:GridWorld, items:List[Tuple[List[int],List[int]
     return [{'type':'compare','s':s,'p1':p1,'p2':p2} for (p1,p2) in items]
 
 
+def _path_after_action(env:GridWorld, start:Tuple[int,int], action:int):
+    r,c = start
+    dr,dc = ACTION_VECS[action]
+    nr,nc = r+dr, c+dc
+    if env.in_bounds(nr,nc) and (nr,nc) not in env.walls:
+        return (nr,nc)
+    return start
+
+
+def make_alternative_path(env:GridWorld, start:Tuple[int,int], base_path:List[int], max_extra_steps:int=3):
+    """
+    Create a path that diverges from ``base_path`` at some prefix but stays
+    relatively close in length. Returns ``None`` if no viable alternative is
+    found.
+    """
+    if not base_path:
+        return None
+
+    # Trace the states along the base path for convenience.
+    states=[start]
+    cur=start
+    for a in base_path:
+        cur=_path_after_action(env, cur, a)
+        states.append(cur)
+
+    for idx in range(len(base_path)):
+        state = states[idx]
+        preferred = base_path[idx]
+        # try alternative moves except going immediately backwards
+        alternatives=[]
+        for a,(nr,nc) in env.neighbors(state):
+            if a==preferred:
+                continue
+            if idx>0 and (nr,nc)==states[idx-1]:
+                continue
+            alternatives.append((a,(nr,nc)))
+        random.shuffle(alternatives)
+        for a,(nr,nc) in alternatives:
+            tail = env.shortest_path((nr,nc), env.cfg.goal)
+            if tail is None:
+                continue
+            alt_path = base_path[:idx] + [a] + tail
+            if alt_path == base_path:
+                continue
+            if len(alt_path) <= len(base_path) + max_extra_steps:
+                return alt_path
+    return None
+
+
+def sample_balanced_comparisons(env:GridWorld, n_pairs:int=4):
+    """
+    Sample comparative queries with non-degenerate, length-balanced pairs.
+    """
+    queries=[]
+    attempts=0
+    max_attempts=max(10, n_pairs*6)
+    while len(queries)<n_pairs and attempts<max_attempts:
+        attempts+=1
+        s = random.choice(env._all_states)
+        base = env.shortest_path(s, env.cfg.goal)
+        if base is None or not base:
+            continue
+        alt = make_alternative_path(env, s, base)
+        if not alt:
+            continue
+        if random.random()<0.5:
+            p1,p2 = base, alt
+        else:
+            p1,p2 = alt, base
+        queries.append({'type':'compare','s':s,'p1':p1,'p2':p2})
+    return queries
+
+
 # ------------------------- Plan / distance utilities -------------------------
 
 def levenshtein(a:List[int], b:List[int]):
@@ -245,7 +318,7 @@ class MultiMetricProgression:
             'prefix': 0.2,
             'value_drift': 0.15,
             'reach_jaccard': 0.15,
-            'levenshtein': 0.0 if not include_lev else 0.05,
+            'levenshtein': 0.0 if not include_lev else 0.01,
         }
 
     def plan_for_query(self, q):
@@ -342,9 +415,28 @@ class QDIN(nn.Module):
         self.A=4
         self.K=K
 
-        # state embedding: index of state as one-hot -> MLP
+        # state embedding: index of state as one-hot -> MLP + structured context
         self.state_idx = {s:i for i,s in enumerate(env._all_states)}
         self.embed_s = nn.Embedding(self.S, hidden)
+        self.coord_proj = nn.Linear(2, hidden)
+
+        conv_channels = max(4, hidden // 4)
+        self.grid_conv = nn.Sequential(
+            nn.Conv2d(3, conv_channels, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(conv_channels, hidden, kernel_size=1),
+            nn.ReLU(),
+        )
+        occ = torch.zeros(3, self.env.cfg.H, self.env.cfg.W)
+        for (r,c) in self.env.walls:
+            occ[0, r, c] = 1.0
+        sr, sc = self.env.start
+        gr, gc = self.env.goal
+        occ[1, sr, sc] = 1.0
+        occ[2, gr, gc] = 1.0
+        self.register_buffer('occ_grid', occ.unsqueeze(0))
+        self._cached_grid_feat: Optional[torch.Tensor] = None
+        self._cached_grid_device: Optional[torch.device] = None
 
         # query embeddings: type id + a small numeric vector
         self.type2id = {'value':0,'q':1,'policy':2,'reachable':3,'pathcost':4,'compare':5}
@@ -440,10 +532,27 @@ class QDIN(nn.Module):
         qvec = self.fc_q(nums)
         return (t_emb + qvec)  # [1,hidden]
 
+    def _get_grid_features(self):
+        device = next(self.parameters()).device
+        if (self._cached_grid_feat is None) or (self._cached_grid_device != device):
+            self._cached_grid_feat = self.grid_conv(self.occ_grid.to(device))
+            self._cached_grid_device = device
+        return self._cached_grid_feat
+
     def encode_state(self, s:Tuple[int,int]):
         i = self.state_idx[s]
-        idx = torch.tensor([i]).long()
-        return self.embed_s(idx)  # [1,hidden]
+        device = next(self.parameters()).device
+        idx = torch.tensor([i], device=device).long()
+        base = self.embed_s(idx)  # [1,hidden]
+
+        H = max(1, self.env.cfg.H - 1)
+        W = max(1, self.env.cfg.W - 1)
+        r, c = s
+        coord = torch.tensor([[r / H, c / W]], device=device).float()
+        coord_feat = torch.tanh(self.coord_proj(coord))
+
+        grid_feat = self._get_grid_features()[:, :, r, c]
+        return base + coord_feat + grid_feat  # [1,hidden]
 
     def forward(self, q:Dict[str,Any]):
         device = next(self.parameters()).device
@@ -489,7 +598,48 @@ class LossWeights:
     explic: float = 0.1
     model: float = 0.25
 
-def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:Dict[str,Any], w:LossWeights):
+    def as_dict(self) -> Dict[str, float]:
+        return {
+            'td': float(self.td),
+            'inf': float(self.inf),
+            'explic': float(self.explic),
+            'model': float(self.model),
+        }
+
+
+class MultiTaskLossBalancer(nn.Module):
+    """Homoscedastic uncertainty weighting for multi-head losses."""
+
+    def __init__(self, task_names:List[str]):
+        super().__init__()
+        self.log_vars = nn.ParameterDict({
+            name: nn.Parameter(torch.zeros(1)) for name in task_names
+        })
+        if not self.log_vars:
+            # maintain at least one parameter to keep device tracking simple
+            self.log_vars['dummy'] = nn.Parameter(torch.zeros(1), requires_grad=False)
+
+    def active_tasks(self) -> List[str]:
+        return [k for k in self.log_vars.keys() if k != 'dummy']
+
+    def combine(self, losses:Dict[str, torch.Tensor], base_weights:Dict[str, float]):
+        device = next(iter(self.log_vars.values())).device
+        total = torch.zeros(1, device=device)
+        scaled = {}
+        for name, loss in losses.items():
+            weight = base_weights.get(name, 0.0)
+            if weight <= 0.0:
+                continue
+            if name not in self.log_vars:
+                # lazily add if not present (e.g., late-phase task)
+                self.log_vars[name] = nn.Parameter(torch.zeros(1, device=device))
+            log_var = self.log_vars[name]
+            inv_var = torch.exp(-log_var)
+            total = total + weight * inv_var * loss + log_var
+            scaled[name] = float((weight * inv_var * loss).item())
+        return total.squeeze(0), scaled
+
+def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:Dict[str,Any], w:LossWeights, balancer:Optional[MultiTaskLossBalancer]=None):
     device = next(model.parameters()).device
     loss_inf = torch.tensor(0.0, device=device)
     bsz = len(batch_q)
@@ -590,7 +740,24 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
     else:
         loss_model = torch.tensor(0.0, device=device)
 
-    total_loss = w.inf*loss_inf + w.explic*loss_explic + w.td*loss_td + w.model*loss_model
+    losses = {
+        'inf': loss_inf,
+        'explic': loss_explic,
+        'td': loss_td,
+        'model': loss_model,
+    }
+    base_weights = w.as_dict()
+    active_losses = {k: v for k, v in losses.items() if base_weights.get(k, 0.0) > 0.0}
+    if balancer is not None and active_losses:
+        total_loss, scaled_parts = balancer.combine(active_losses, base_weights)
+    else:
+        total_loss = torch.tensor(0.0, device=loss_inf.device)
+        scaled_parts = {}
+        for name, loss_val in active_losses.items():
+            weight = base_weights.get(name, 1.0)
+            total_loss = total_loss + weight * loss_val
+            scaled_parts[name] = float((weight * loss_val).item())
+
     parts = dict(
         inf=float(loss_inf.item()),
         explic=float(loss_explic.item()),
@@ -599,39 +766,130 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
         model_T=float(loss_model_T.item()),
         model_R=float(loss_model_R.item()),
     )
+    for name, val in scaled_parts.items():
+        parts[f'weighted_{name}'] = val
     return total_loss, parts
 
 
 # ------------------------- Active coverage selection -------------------------
 
-def select_queries_active_coverage(env:GridWorld, mmp:MultiMetricProgression, VQ:Tuple[Dict,Dict], batch_size:int=16):
-    """
-    Simple heuristic: sample candidates; pick a progressive sequence that
-    maximizes diversity over locations and types while minimizing progression cost.
-    """
-    V, Q = VQ
-    # candidate pool
-    cand=[]
-    states = random.sample(env._all_states, k=min(len(env._all_states), 20))
-    for s in states:
-        cand += make_point_queries(env, [s], ACTIONS[:2])
-        cand += make_set_queries(env, [s], k=3)
-    # random path queries
-    for _ in range(6):
-        s = random.choice(env._all_states); g = random.choice(env._all_states)
-        cand += make_path_queries(env, [(s,g)], cost_per_step=abs(env.cfg.step_cost))
-    # comparative
-    for _ in range(4):
-        s = random.choice(env._all_states)
-        p1 = env.shortest_path(s, env.cfg.goal) or []
-        p2 = p1[:-1]
-        cand += make_comparative_queries(env, [(p1,p2)], s)
+CURRICULUM_PHASES = [
+    ("point", 0.25),
+    ("reach", 0.55),
+    ("path", 0.8),
+    ("compare", 1.0),
+]
 
-    random.shuffle(cand)
-    cand = cand[:max(batch_size*3, 32)]
-    # order by MMP
+
+def curriculum_phase(ep:int, total:int) -> Tuple[str, float]:
+    if total <= 0:
+        return CURRICULUM_PHASES[-1][0], 1.0
+    ratio = (ep + 1) / total
+    ratio = min(max(ratio, 0.0), 1.0)
+    prev = 0.0
+    for name, bound in CURRICULUM_PHASES:
+        if ratio <= bound:
+            span = max(bound - prev, 1e-6)
+            progress = (ratio - prev) / span
+            return name, float(min(max(progress, 0.0), 1.0))
+        prev = bound
+    return CURRICULUM_PHASES[-1][0], 1.0
+
+
+def progressive_reach_ks(progress:float, include_history:bool=False) -> List[int]:
+    if progress < 0.34:
+        ks = [2]
+    elif progress < 0.67:
+        ks = [3]
+    else:
+        ks = [5]
+    if include_history:
+        history = [k for k in [2, 3, 5] if k <= ks[-1]]
+        ks = sorted(set(history + ks))
+    return ks
+
+
+def enforce_prefix_stability(ordered:List[Dict], mmp:MultiMetricProgression, min_prefix:int=1) -> List[Dict]:
+    if not ordered:
+        return []
+    stabilized = [ordered[0]]
+    remaining = ordered[1:]
+    while remaining:
+        prev_plan = mmp.plan_for_query(stabilized[-1])
+        prefix_len = min(min_prefix, len(prev_plan))
+        prefix = tuple(prev_plan[:prefix_len]) if prefix_len > 0 else tuple()
+        best_idx = None
+        best_dist = float('inf')
+        fallback_idx = None
+        fallback_dist = float('inf')
+        for idx, cand in enumerate(remaining):
+            plan = mmp.plan_for_query(cand)
+            dist = mmp.dist(stabilized[-1], cand)
+            if dist < fallback_dist:
+                fallback_dist = dist
+                fallback_idx = idx
+            if prefix:
+                cand_prefix = tuple(plan[:prefix_len])
+                if cand_prefix != prefix:
+                    continue
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+        choice = best_idx if best_idx is not None else fallback_idx
+        stabilized.append(remaining.pop(choice))
+    return stabilized
+
+
+def select_queries_active_coverage(env:GridWorld, mmp:MultiMetricProgression, VQ:Tuple[Dict,Dict], batch_size:int=16, phase:str="full", phase_progress:float=1.0):
+    """
+    Sample curriculum-aware query batches ordered by MMP and stabilized via
+    OEG-style prefix constraints.
+    """
+    include_point = phase in ("point", "reach", "path", "compare", "full")
+    include_reach = phase in ("reach", "path", "compare", "full")
+    include_path = phase in ("path", "compare", "full")
+    include_compare = phase in ("compare", "full")
+
+    cand: List[Dict] = []
+    state_pool = env._all_states[:]
+    random.shuffle(state_pool)
+
+    if include_point:
+        num_states = max(1, batch_size // 6)
+        states = state_pool[:num_states]
+        cand += make_point_queries(env, states, ACTIONS)
+
+    if include_reach:
+        num_states = max(1, batch_size // 4)
+        states = state_pool[:num_states]
+        ks = progressive_reach_ks(phase_progress, include_history=phase not in ("reach",))
+        for s in states:
+            for k in ks:
+                cand.append({'type':'reachable','s':s,'k':k})
+
+    if include_path:
+        num_paths = max(1, batch_size // 6)
+        for _ in range(num_paths * 2):
+            s = random.choice(env._all_states)
+            g = random.choice(env._all_states)
+            if s == g:
+                continue
+            cand += make_path_queries(env, [(s, g)], cost_per_step=abs(env.cfg.step_cost))
+            if len(cand) >= batch_size * 3:
+                break
+
+    if include_compare:
+        num_pairs = max(1, batch_size // 6)
+        cand += sample_balanced_comparisons(env, n_pairs=num_pairs)
+
+    if not cand:
+        return []
+
+    max_candidates = max(batch_size * 3, 64)
+    cand = cand[:max_candidates]
     ordered = mmp.order_queries_progressively(cand)
-    return ordered[:batch_size]
+    stabilized = enforce_prefix_stability(ordered, mmp, min_prefix=1)
+    return stabilized[:batch_size]
 
 
 # ------------------------- Evaluation metrics -------------------------

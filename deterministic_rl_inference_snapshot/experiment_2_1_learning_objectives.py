@@ -12,31 +12,33 @@ def train_mode(env, mode:str, episodes:int=600, seed:int=0):
 
     if mode=="control-only":
         model = QDIN(env).to(device)
-        opt = torch.optim.Adam(model.parameters(), lr=5e-4)
-        w = LossWeights(td=1.0, inf=0.0, explic=0.0)
+        w = LossWeights(td=1.0, inf=0.0, explic=0.0, model=0.25)
     elif mode=="query-only":
         model = QDIN(env).to(device)
-        opt = torch.optim.Adam(model.parameters(), lr=5e-4)
-        w = LossWeights(td=0.0, inf=1.0, explic=0.05)
+        w = LossWeights(td=0.0, inf=1.0, explic=0.05, model=0.25)
     elif mode=="mixed":
         model = QDIN(env).to(device)
-        opt = torch.optim.Adam(model.parameters(), lr=5e-4)
-        w = LossWeights(td=0.1, inf=1.0, explic=0.05)
+        w = LossWeights(td=0.1, inf=1.0, explic=0.05, model=0.25)
     else:
         raise ValueError("Unknown mode")
+
+    balancer = MultiTaskLossBalancer([k for k,v in w.as_dict().items() if v>0]).to(device)
+    params = list(model.parameters()) + list(balancer.parameters())
+    opt = torch.optim.Adam(params, lr=5e-4)
 
     # baseline control reward estimator using trained DQN
     dqn = train_dqn(env, steps=1200)
 
     tracker = ExperimentTracker()
     for ep in range(episodes):
-        batch = select_queries_active_coverage(env, mmp, (gt['V'],gt['Q']), batch_size=24)
-        loss, parts = inference_aware_loss(model, env, batch, gt, w)
+        phase, progress = curriculum_phase(ep, episodes)
+        batch = select_queries_active_coverage(env, mmp, (gt['V'],gt['Q']), batch_size=24, phase=phase, phase_progress=progress)
+        loss, parts = inference_aware_loss(model, env, batch, gt, w, balancer=balancer)
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
 
         if (ep+1)%100==0:
             # inference metrics
-            test_q = select_queries_active_coverage(env, mmp, (gt['V'],gt['Q']), batch_size=50)
+            test_q = select_queries_active_coverage(env, mmp, (gt['V'],gt['Q']), batch_size=50, phase="full", phase_progress=1.0)
             infm = evaluate_query_answering(model, env, test_q)
             # control proxy: evaluate greedy policy from QDIN vs DQN returns on rollouts
             rew_qdin = rollouts_return(env, lambda s: int(torch.argmax(model({'type':'policy','s':s})['policy']).item()), n_episodes=20)
