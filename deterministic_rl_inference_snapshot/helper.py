@@ -534,8 +534,20 @@ class QDIN(nn.Module):
 
     def _get_grid_features(self):
         device = next(self.parameters()).device
+        occ = self.occ_grid.to(device)
+        if self.training:
+            # When training we must recompute the convolutional features on every
+            # forward pass so that gradients can flow through the convolutional
+            # parameters. Caching tensors that require gradients would cause
+            # autograd to reuse a graph from a previous iteration and error out
+            # during ``backward``.
+            return self.grid_conv(occ)
+
+        # During evaluation we can safely cache the features to avoid the extra
+        # convolution as no gradients are required.
         if (self._cached_grid_feat is None) or (self._cached_grid_device != device):
-            self._cached_grid_feat = self.grid_conv(self.occ_grid.to(device))
+            with torch.no_grad():
+                self._cached_grid_feat = self.grid_conv(occ)
             self._cached_grid_device = device
         return self._cached_grid_feat
 
