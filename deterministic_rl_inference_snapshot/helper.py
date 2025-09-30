@@ -16,6 +16,7 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
     from torch import Tensor
+    from torch.nn.utils import clip_grad_norm_
 except Exception as e:
     raise RuntimeError("PyTorch is required. Please run install_requirements.py first.")
 
@@ -26,6 +27,8 @@ Action = int  # 0:up,1:right,2:down,3:left
 ACTIONS = [0,1,2,3]
 ACTION_VECS = {0: (-1,0), 1:(0,1), 2:(1,0), 3:(0,-1)}
 ACTION_NAMES = {0:"U",1:"R",2:"D",3:"L"}
+
+REACH_LOSS_SCALE = 0.3
 
 @dataclass
 class GridConfig:
@@ -348,8 +351,30 @@ class QDIN(nn.Module):
         self.embed_t = nn.Embedding(len(self.type2id), hidden)
         self.fc_q = nn.Linear(6, hidden)  # room for small query params
 
-        # learned "model": transition logits and rewards (dense)
-        self.T_logits = nn.Parameter(torch.zeros(self.A, self.S, self.S))  # a -> s -> s'
+        # learned "model": transition logits and rewards (masked by valid neighbors)
+        neighbor_lists=[]
+        for s in env._all_states:
+            candidates=[]
+            r,c=s
+            for a in ACTIONS:
+                dr,dc=ACTION_VECS[a]
+                nr,nc=r+dr,c+dc
+                if env.in_bounds(nr,nc) and (nr,nc) not in env.walls:
+                    candidates.append(self.state_idx[(nr,nc)])
+            if not candidates:
+                candidates.append(self.state_idx[s])
+            neighbor_lists.append(candidates)
+        self.max_neighbors=max(len(c) for c in neighbor_lists)
+        neighbor_idx=torch.full((self.S, self.max_neighbors), -1, dtype=torch.long)
+        neighbor_counts=[]
+        for i,cands in enumerate(neighbor_lists):
+            count=len(cands)
+            neighbor_counts.append(count)
+            neighbor_idx[i, :count]=torch.tensor(cands, dtype=torch.long)
+        self.register_buffer('neighbor_idx', neighbor_idx)
+        self.register_buffer('neighbor_counts', torch.tensor(neighbor_counts, dtype=torch.long))
+
+        self.T_logits = nn.Parameter(torch.zeros(self.A, self.S, self.max_neighbors))  # a -> s -> neighbors
         nn.init.xavier_uniform_(self.T_logits)
         self.R = nn.Parameter(torch.zeros(self.S, self.A))
         nn.init.xavier_uniform_(self.R)
@@ -363,20 +388,42 @@ class QDIN(nn.Module):
         self.h_value = nn.Linear(hidden, 1)
         self.h_q = nn.Linear(hidden, self.A)
         self.h_policy = nn.Linear(hidden, self.A)
-        self.h_set = nn.Linear(hidden, self.S)      # reachability mask
         self.h_pathcost = nn.Linear(hidden, 1)
         self.h_explic = nn.Linear(hidden, 1)
 
+        for head in [self.h_value, self.h_q, self.h_policy, self.h_pathcost, self.h_explic]:
+            nn.init.normal_(head.weight, mean=0.0, std=0.01)
+            nn.init.constant_(head.bias, 0.0)
+
+    def transition_matrix(self):
+        device = self.T_logits.device
+        T_logits = torch.full((self.A, self.S, self.S), float('-inf'), device=device)
+        for s_idx in range(self.S):
+            count = int(self.neighbor_counts[s_idx].item())
+            if count == 0:
+                continue
+            idxs = self.neighbor_idx[s_idx, :count]
+            T_logits[:, s_idx, idxs] = self.T_logits[:, s_idx, :count]
+        return torch.softmax(T_logits, dim=-1)
+
+    def reachability_from_T(self, T:torch.Tensor, s:Tuple[int,int], k:int):
+        device = T.device
+        p = torch.zeros(self.S, device=device)
+        p[self.state_idx[s]] = 1.0
+        for _ in range(k):
+            p = torch.einsum('ask,s->k', T, p)
+            p = torch.clamp(p, 0.0, 1.0)
+        return p
+
     def vi_block(self, gamma=0.99):
-        # Perform K value-iteration steps over learned (dense) model
-        # Softmax over next states
-        T = torch.softmax(self.T_logits, dim=-1)  # [A,S,S]
+        # Perform K value-iteration steps over learned (masked) model
+        T = self.transition_matrix()  # [A,S,S]
         R = self.R  # [S,A]
         V = torch.zeros(self.S, device=R.device)
         for _ in range(self.K):
-            Q = R + gamma * torch.einsum('ask, k -> sa', T, V)  # [S,A]
+            Q = R + gamma * torch.einsum('ask,k->sa', T, V)  # [S,A]
             V = torch.max(Q, dim=1).values
-        return V, Q  # [S], [S,A]
+        return V, Q, T  # [S], [S,A], [A,S,S]
 
     def encode_query(self, q:Dict[str,Any]):
         # numeric features: s_idx, a, k, g_idx_r, g_idx_c (if provided)
@@ -401,7 +448,7 @@ class QDIN(nn.Module):
     def forward(self, q:Dict[str,Any]):
         device = next(self.parameters()).device
         # run VI block to get global value landscape
-        V_all, Q_all = self.vi_block()
+        V_all, Q_all, T_all = self.vi_block()
         V_all = V_all.unsqueeze(0)        # [1,S]
         Q_all = Q_all.unsqueeze(0)        # [1,S,A]
 
@@ -424,7 +471,10 @@ class QDIN(nn.Module):
         out['value'] = self.h_value(x).squeeze(0)          # [1]
         out['q'] = self.h_q(x).squeeze(0)                  # [A]
         out['policy'] = self.h_policy(x).squeeze(0)        # [A]
-        out['set_logits'] = self.h_set(x).squeeze(0)       # [S]
+        k = q.get('k', 3)
+        reach_probs = self.reachability_from_T(T_all, s, k)
+        reach_logits = torch.logit(reach_probs.clamp(1e-6, 1-1e-6))
+        out['set_logits'] = reach_logits                  # [S]
         out['pathcost'] = self.h_pathcost(x).squeeze(0)    # [1]
         out['explic'] = torch.sigmoid(self.h_explic(x)).squeeze(0) # [1] in [0,1]
         return out
@@ -437,6 +487,7 @@ class LossWeights:
     td: float = 0.2
     inf: float = 1.0
     explic: float = 0.1
+    model: float = 0.25
 
 def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:Dict[str,Any], w:LossWeights):
     device = next(model.parameters()).device
@@ -467,7 +518,8 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
             idxs=[model.state_idx[s] for s in R]
             mask[idxs]=1.0
             pred = out['set_logits']
-            loss_inf = loss_inf + F.binary_cross_entropy_with_logits(pred, mask)
+            reach_loss = F.binary_cross_entropy_with_logits(pred, mask)
+            loss_inf = loss_inf + REACH_LOSS_SCALE * reach_loss
         elif t=='pathcost':
             # path cost approximated by step count * |step_cost|
             P = env.shortest_path(q['s'], q['g']) or []
@@ -515,7 +567,39 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
         loss_td = loss_td + F.mse_loss(qsa, y)
     loss_td = loss_td / max(1, bsz//2)
 
-    return w.inf*loss_inf + w.explic*loss_explic + w.td*loss_td, dict(inf=float(loss_inf.item()), explic=float(loss_explic.item()), td=float(loss_td.item()))
+    # Model supervision: anchor transitions and rewards to real samples
+    loss_model_T = torch.tensor(0.0, device=device)
+    loss_model_R = torch.tensor(0.0, device=device)
+    n_transitions = max(1, bsz)
+    if w.model > 0.0:
+        T_model = model.transition_matrix()
+        for _ in range(n_transitions):
+            s = random.choice(env._all_states)
+            a = random.choice(ACTIONS)
+            env.state = s
+            s2, r, _, _ = env.step(a)
+            si = model.state_idx[s]
+            s2i = model.state_idx[s2]
+            prob = T_model[a, si, s2i].clamp_min(1e-8)
+            loss_model_T = loss_model_T - torch.log(prob)
+            r_pred = model.R[si, a]
+            loss_model_R = loss_model_R + F.mse_loss(r_pred, torch.tensor(float(r), device=device))
+        loss_model_T = loss_model_T / n_transitions
+        loss_model_R = loss_model_R / n_transitions
+        loss_model = loss_model_T + loss_model_R
+    else:
+        loss_model = torch.tensor(0.0, device=device)
+
+    total_loss = w.inf*loss_inf + w.explic*loss_explic + w.td*loss_td + w.model*loss_model
+    parts = dict(
+        inf=float(loss_inf.item()),
+        explic=float(loss_explic.item()),
+        td=float(loss_td.item()),
+        model=float(loss_model.item()),
+        model_T=float(loss_model_T.item()),
+        model_R=float(loss_model_R.item()),
+    )
+    return total_loss, parts
 
 
 # ------------------------- Active coverage selection -------------------------
@@ -628,7 +712,7 @@ def train_dqn(env:GridWorld, steps=2000, lr=1e-3, gamma=0.99):
             y = r + (0.0 if done else gamma*torch.max(qn).item())
         qsa = dqn.forward(s)[a]
         loss = F.mse_loss(qsa, torch.tensor(y, device=device).float())
-        opt.zero_grad(); loss.backward(); opt.step()
+        opt.zero_grad(); loss.backward(); clip_grad_norm_(dqn.parameters(), 1.0); opt.step()
         s = env.reset() if done else s2
     return dqn
 
@@ -662,15 +746,19 @@ class ExperimentTracker:
         return summary
 
 def build_default_env(seed=0):
-    walls=[]
     H=W=8
     rng=random.Random(seed)
-    # Add a few random walls
-    for _ in range(8):
-        r=rng.randint(0,H-1); c=rng.randint(0,W-1)
-        if (r,c) not in [(0,0),(H-1,W-1)]: walls.append((r,c))
-    cfg=GridConfig(H=H,W=W,walls=walls,start=(0,0),goal=(H-1,W-1),step_cost=-1.0,goal_reward=0.0,seed=seed)
-    return GridWorld(cfg)
+    while True:
+        walls=[]
+        for _ in range(8):
+            r=rng.randint(0,H-1); c=rng.randint(0,W-1)
+            if (r,c) not in [(0,0),(H-1,W-1)]:
+                if (r,c) not in walls:
+                    walls.append((r,c))
+        cfg=GridConfig(H=H,W=W,walls=walls,start=(0,0),goal=(H-1,W-1),step_cost=-1.0,goal_reward=0.0,seed=seed)
+        env=GridWorld(cfg)
+        if env.shortest_path(cfg.start, cfg.goal) is not None:
+            return env
 
 
 def make_ground_truth(env:GridWorld):
