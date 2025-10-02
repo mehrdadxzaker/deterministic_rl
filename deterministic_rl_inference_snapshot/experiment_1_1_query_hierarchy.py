@@ -32,7 +32,11 @@ def run_experiment_1_1(grid_size=8, n_obstacles=8, episodes=600, seed=0):
             test_q = select_queries_active_coverage(env, mmp, (gt['V'],gt['Q']), batch_size=40, phase="full", phase_progress=1.0)
             metrics = evaluate_query_answering(model, env, test_q)
             tracker.log(ep=ep+1, loss=float(loss.item()), **metrics)
-            print(f"[E1.1] ep={ep+1:4d} loss={loss.item():.3f} acc={metrics['acc']:.3f} meanIoU={metrics['set_mean_iou']:.3f}")
+            print(
+                f"[E1.1] ep={ep+1:4d} loss={loss.item():.3f} "
+                f"acc={metrics['overall_acc']:.3f} pol={metrics['policy_acc']:.3f} "
+                f"IoU={metrics['reach_mean_iou']:.3f} pathMAE={metrics['path_mae']:.3f}"
+            )
     summary = tracker.summary()
     print("[E1.1] Summary:", summary)
     return summary

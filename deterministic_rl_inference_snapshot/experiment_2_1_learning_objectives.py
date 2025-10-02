@@ -40,26 +40,42 @@ def train_mode(env, mode:str, episodes:int=600, seed:int=0):
             # inference metrics
             test_q = select_queries_active_coverage(env, mmp, (gt['V'],gt['Q']), batch_size=50, phase="full", phase_progress=1.0)
             infm = evaluate_query_answering(model, env, test_q)
-            # control proxy: evaluate greedy policy from QDIN vs DQN returns on rollouts
-            rew_qdin = rollouts_return(env, lambda s: int(torch.argmax(model({'type':'policy','s':s})['policy']).item()), n_episodes=20)
-            rew_dqn = rollouts_return(env, lambda s: dqn.act(s, eps=0.01), n_episodes=20)
-            tracker.log(ep=ep+1, mode=mode, loss=float(loss.item()), inf_acc=infm['acc'], set_iou=infm['set_mean_iou'], ret_qdin=rew_qdin, ret_dqn=rew_dqn)
-            print(f"[E2.1][{mode}] ep={ep+1:4d} loss={loss.item():.3f} inf_acc={infm['acc']:.3f} IoU={infm['set_mean_iou']:.3f} R_qdin={rew_qdin:.1f} R_dqn={rew_dqn:.1f}")
+            metrics_qdin = rollouts_control_metrics(
+                env,
+                greedy_action_fn=lambda s: model.greedy_action(s),
+                q_fn=lambda s: model.q_values(s),
+                n_episodes=20,
+            )
+            metrics_dqn = rollouts_control_metrics(
+                env,
+                greedy_action_fn=lambda s: dqn.greedy_action(s),
+                q_fn=lambda s: dqn.q_values(s),
+                n_episodes=20,
+            )
+            tracker.log(
+                ep=ep+1,
+                mode=mode,
+                loss=float(loss.item()),
+                overall_acc=infm['overall_acc'],
+                policy_acc=infm['policy_acc'],
+                reach_iou=infm['reach_mean_iou'],
+                path_mae=infm['path_mae'],
+                compare_acc=infm['compare_acc'],
+                ret_qdin=metrics_qdin['avg_return'],
+                ret_dqn=metrics_dqn['avg_return'],
+                goal_rate_qdin=metrics_qdin['goal_reach_rate'],
+                goal_rate_dqn=metrics_dqn['goal_reach_rate'],
+                steps_qdin=metrics_qdin['steps_to_goal'],
+                steps_dqn=metrics_dqn['steps_to_goal'],
+            )
+            print(
+                f"[E2.1][{mode}] ep={ep+1:4d} loss={loss.item():.3f} "
+                f"acc={infm['overall_acc']:.3f} pol={infm['policy_acc']:.3f} "
+                f"IoU={infm['reach_mean_iou']:.3f} pathMAE={infm['path_mae']:.3f} "
+                f"R_qdin={metrics_qdin['avg_return']:.1f} (succ={metrics_qdin['goal_reach_rate']*100:.1f}%) "
+                f"R_dqn={metrics_dqn['avg_return']:.1f} (succ={metrics_dqn['goal_reach_rate']*100:.1f}%)"
+            )
     return tracker.summary()
-
-def rollouts_return(env, policy_fn, n_episodes=10):
-    tot=0.0
-    max_steps = 4 * env.cfg.H * env.cfg.W
-    for _ in range(n_episodes):
-        s=env.reset(); ret=0.0
-        for t in range(max_steps):
-            if s==env.cfg.goal: break
-            a=policy_fn(s)
-            s,r,done,_=env.step(a)
-            ret += r
-            if done: break
-        tot+=ret
-    return tot/n_episodes
 
 def run_experiment_2_1(grid_size=8, n_obstacles=8, episodes=600, seed=0):
     env = build_default_env(seed=seed)
