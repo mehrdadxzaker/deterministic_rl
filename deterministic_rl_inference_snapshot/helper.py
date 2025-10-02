@@ -29,6 +29,15 @@ ACTION_VECS = {0: (-1,0), 1:(0,1), 2:(1,0), 3:(0,-1)}
 ACTION_NAMES = {0:"U",1:"R",2:"D",3:"L"}
 
 REACH_LOSS_SCALE = 0.3
+ENTROPY_REG_WEIGHT = 1e-3
+EXPLIC_TEMP_MIN = 0.5
+EXPLIC_TEMP_MAX = 5.0
+
+
+def log_event(tag: str, **kwargs: Any) -> None:
+    """Light-weight structured logging helper."""
+    fields = ", ".join(f"{k}={kwargs[k]}" for k in sorted(kwargs)) if kwargs else ""
+    print(f"[LOG][{tag}] {fields}")
 
 @dataclass
 class GridConfig:
@@ -480,10 +489,10 @@ class QDIN(nn.Module):
         self.h_value = nn.Linear(hidden, 1)
         self.h_q = nn.Linear(hidden, self.A)
         self.h_policy = nn.Linear(hidden, self.A)
-        self.h_pathcost = nn.Linear(hidden, 1)
         self.h_explic = nn.Linear(hidden, 1)
+        self.log_explic_temp = nn.Parameter(torch.zeros(1))
 
-        for head in [self.h_value, self.h_q, self.h_policy, self.h_pathcost, self.h_explic]:
+        for head in [self.h_value, self.h_q, self.h_policy, self.h_explic]:
             nn.init.normal_(head.weight, mean=0.0, std=0.01)
             nn.init.constant_(head.bias, 0.0)
 
@@ -516,6 +525,30 @@ class QDIN(nn.Module):
             Q = R + gamma * torch.einsum('ask,k->sa', T, V)  # [S,A]
             V = torch.max(Q, dim=1).values
         return V, Q, T  # [S], [S,A], [A,S,S]
+
+    def expected_path_cost(self, start: Tuple[int, int], actions: List[int], T: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Compute the expected cumulative *cost* (negative reward) of following ``actions``."""
+        if T is None:
+            T = self.transition_matrix()
+        device = T.device
+        state_dist = torch.zeros(self.S, device=device)
+        state_dist[self.state_idx[start]] = 1.0
+        total_cost = torch.zeros(1, device=device)
+        for a in actions:
+            a = int(a)
+            reward = torch.matmul(state_dist, self.R[:, a])
+            total_cost = total_cost - reward
+            state_dist = torch.matmul(state_dist, T[a])
+        return total_cost.squeeze(0)
+
+    @torch.no_grad()
+    def greedy_action(self, s: Tuple[int, int]) -> int:
+        q_vals = self({'type': 'q', 's': s})['q']
+        return int(torch.argmax(q_vals).item())
+
+    @torch.no_grad()
+    def q_values(self, s: Tuple[int, int]) -> torch.Tensor:
+        return self({'type': 'q', 's': s})['q']
 
     def encode_query(self, q:Dict[str,Any]):
         # numeric features: s_idx, a, k, g_idx_r, g_idx_c (if provided)
@@ -596,8 +629,20 @@ class QDIN(nn.Module):
         reach_probs = self.reachability_from_T(T_all, s, k)
         reach_logits = torch.logit(reach_probs.clamp(1e-6, 1-1e-6))
         out['set_logits'] = reach_logits                  # [S]
-        out['pathcost'] = self.h_pathcost(x).squeeze(0)    # [1]
-        out['explic'] = torch.sigmoid(self.h_explic(x)).squeeze(0) # [1] in [0,1]
+        path_actions = q.get('path_actions')
+        if path_actions is None:
+            if q['type'] == 'pathcost':
+                path_actions = self.env.shortest_path(s, q.get('g', self.env.cfg.goal)) or []
+            elif q['type'] == 'compare':
+                path_actions = q.get('p1', [])
+            else:
+                path_actions = []
+        path_cost = self.expected_path_cost(s, path_actions, T_all)
+        out['pathcost'] = path_cost
+
+        temp = torch.exp(self.log_explic_temp).clamp(EXPLIC_TEMP_MIN, EXPLIC_TEMP_MAX)
+        explic_logits = self.h_explic(x) / temp
+        out['explic'] = torch.sigmoid(explic_logits).squeeze(0) # [1] in [0,1]
         return out
 
 
@@ -611,10 +656,11 @@ class LossWeights:
     model: float = 0.25
 
     def as_dict(self) -> Dict[str, float]:
+        explic_w = float(min(self.explic, 0.1))
         return {
             'td': float(self.td),
             'inf': float(self.inf),
-            'explic': float(self.explic),
+            'explic': explic_w,
             'model': float(self.model),
         }
 
@@ -651,12 +697,37 @@ class MultiTaskLossBalancer(nn.Module):
             scaled[name] = float((weight * inv_var * loss).item())
         return total.squeeze(0), scaled
 
+
+def _smooth_binary_targets(target: torch.Tensor, eps: float = 0.05) -> torch.Tensor:
+    return target * (1.0 - eps) + 0.5 * eps
+
+
+def path_cost_ground_truth(env: GridWorld, start: Tuple[int, int], actions: List[int]) -> float:
+    cur = start
+    total = 0.0
+    for a in actions:
+        dr, dc = ACTION_VECS[a]
+        nr, nc = cur[0] + dr, cur[1] + dc
+        if env.in_bounds(nr, nc) and (nr, nc) not in env.walls:
+            nxt = (nr, nc)
+        else:
+            nxt = cur
+        total -= env.cfg.step_cost
+        cur = nxt
+        if cur == env.cfg.goal:
+            total -= env.cfg.goal_reward
+            break
+    return float(total)
+
+
 def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:Dict[str,Any], w:LossWeights, balancer:Optional[MultiTaskLossBalancer]=None):
     device = next(model.parameters()).device
-    loss_inf = torch.tensor(0.0, device=device)
     bsz = len(batch_q)
+    cached_outputs: List[Dict[str, torch.Tensor]] = []
+    loss_inf = torch.tensor(0.0, device=device)
     for q in batch_q:
         out = model(q)
+        cached_outputs.append(out)
         t = q['type']
         if t=='value':
             y = torch.tensor([targets['V'][q['s']]], device=device).float()
@@ -666,62 +737,57 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
             qsa = out['q'][q['a']]
             loss_inf = loss_inf + F.mse_loss(qsa.view_as(y), y)
         elif t=='policy':
-            # best action label
             s=q['s']
             best = max(ACTIONS, key=lambda a: targets['Q'][(s,a)])
             logits = out['policy'].unsqueeze(0)
             y = torch.tensor([best], device=device).long()
             loss_inf = loss_inf + F.cross_entropy(logits, y)
         elif t=='reachable':
-            # predict k-step reachable set mask
             k=q.get('k',3)
             R = env.k_step_reachable(q['s'], k)
             mask = torch.zeros(model.S, device=device)
             idxs=[model.state_idx[s] for s in R]
             mask[idxs]=1.0
             pred = out['set_logits']
-            reach_loss = F.binary_cross_entropy_with_logits(pred, mask)
+            pos = mask.sum()
+            neg = mask.numel() - pos
+            pos_weight = ((neg + 1.0) / (pos + 1.0)).to(device)
+            target = _smooth_binary_targets(mask, eps=0.05)
+            reach_loss = F.binary_cross_entropy_with_logits(pred, target, pos_weight=pos_weight)
             loss_inf = loss_inf + REACH_LOSS_SCALE * reach_loss
         elif t=='pathcost':
-            # path cost approximated by step count * |step_cost|
-            P = env.shortest_path(q['s'], q['g']) or []
-            y = torch.tensor([float(len(P)) * abs(env.cfg.step_cost)], device=device).float()
-            loss_inf = loss_inf + F.mse_loss(out['pathcost'].view_as(y), y)
+            plan = targets['oracle_plan'](q)
+            gt_cost = torch.tensor([path_cost_ground_truth(env, q['s'], plan)], device=device).float()
+            pred_cost = out['pathcost'].view_as(gt_cost)
+            loss_inf = loss_inf + F.mse_loss(pred_cost, gt_cost)
         elif t=='compare':
-            # binary: is path1 shorter than path2 from s?
             p1, p2 = q['p1'], q['p2']
-            y = torch.tensor([1.0 if len(p1)<len(p2) else 0.0], device=device).float()
-            # reuse policy head: map to a logit via a tiny projection
-            logit = out['policy'].mean()
-            loss_inf = loss_inf + F.binary_cross_entropy_with_logits(logit.view_as(y), y)
+            cost_a = model.expected_path_cost(q['s'], p1)
+            cost_b = model.expected_path_cost(q['s'], p2)
+            logits = torch.stack([-cost_a, -cost_b]).unsqueeze(0)
+            true_cost_a = path_cost_ground_truth(env, q['s'], p1)
+            true_cost_b = path_cost_ground_truth(env, q['s'], p2)
+            y = torch.tensor([0 if true_cost_a <= true_cost_b else 1], device=device).long()
+            loss_inf = loss_inf + F.cross_entropy(logits, y)
     loss_inf = loss_inf / max(1,bsz)
 
-    # Explicability surrogate: higher for shorter, smoother plans (encourage 0-1 near 1)
     explic_targets=[]
     for q in batch_q:
         p = targets['oracle_plan'](q)
-        # explicability proxy = 1 / (1 + edits + bends)
         edits = len(p)
         explic_targets.append(1.0/(1.0+edits))
     explic_targets = torch.tensor(explic_targets, device=device).float().view(-1,1)
-    # ask model once (use last forward)
-    explic_preds=[]
-    for q in batch_q:
-        explic_preds.append(model(q)['explic'])
-    explic_preds = torch.stack([e.view(1) for e in explic_preds], dim=0) # [B,1]
+    explic_preds = torch.stack([out['explic'].view(1) for out in cached_outputs], dim=0)
     loss_explic = F.mse_loss(explic_preds, explic_targets)
 
-    # TD control (optional): simple one-step TD on a random transition batch (tiny)
     loss_td = torch.tensor(0.0, device=device)
     for _ in range(max(1, bsz//2)):
         s = random.choice(env._all_states)
         a = random.choice(ACTIONS)
-        # step deterministically
         env.state = s
         s2, r, done, _ = env.step(a)
         with torch.no_grad():
-            # bootstrap from model's Q on s2
-            qn = model({'type':'policy','s':s2})['policy']
+            qn = model({'type':'q','s':s2})['q']
             bootstrap = 0.0 if done else torch.max(qn).item()
             y_val = r + 0.99 * bootstrap
         qsa = model({'type':'q','s':s,'a':a})['q'][a]
@@ -729,12 +795,12 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
         loss_td = loss_td + F.mse_loss(qsa, y)
     loss_td = loss_td / max(1, bsz//2)
 
-    # Model supervision: anchor transitions and rewards to real samples
     loss_model_T = torch.tensor(0.0, device=device)
     loss_model_R = torch.tensor(0.0, device=device)
     n_transitions = max(1, bsz)
     if w.model > 0.0:
-        T_model = model.transition_matrix()
+        T_matrix = model.transition_matrix()
+        entropy = -(T_matrix.clamp_min(1e-8) * torch.log(T_matrix.clamp_min(1e-8))).sum(dim=-1).mean()
         for _ in range(n_transitions):
             s = random.choice(env._all_states)
             a = random.choice(ACTIONS)
@@ -742,14 +808,15 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
             s2, r, _, _ = env.step(a)
             si = model.state_idx[s]
             s2i = model.state_idx[s2]
-            prob = T_model[a, si, s2i].clamp_min(1e-8)
+            prob = T_matrix[a, si, s2i].clamp_min(1e-8)
             loss_model_T = loss_model_T - torch.log(prob)
             r_pred = model.R[si, a]
             loss_model_R = loss_model_R + F.mse_loss(r_pred, torch.tensor(float(r), device=device))
         loss_model_T = loss_model_T / n_transitions
         loss_model_R = loss_model_R / n_transitions
-        loss_model = loss_model_T + loss_model_R
+        loss_model = loss_model_T + loss_model_R + ENTROPY_REG_WEIGHT * entropy
     else:
+        entropy = torch.tensor(0.0, device=device)
         loss_model = torch.tensor(0.0, device=device)
 
     losses = {
@@ -770,6 +837,12 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
             total_loss = total_loss + weight * loss_val
             scaled_parts[name] = float((weight * loss_val).item())
 
+    if not torch.isfinite(total_loss):
+        diag = {k: float(v.detach().item()) if torch.is_tensor(v) else float(v) for k, v in losses.items()}
+        diag.update({f'scaled_{k}': v for k, v in scaled_parts.items()})
+        log_event("NON_FINITE", **diag)
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+
     parts = dict(
         inf=float(loss_inf.item()),
         explic=float(loss_explic.item()),
@@ -777,6 +850,7 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
         model=float(loss_model.item()),
         model_T=float(loss_model_T.item()),
         model_R=float(loss_model_R.item()),
+        entropy=float(entropy.item()),
     )
     for name, val in scaled_parts.items():
         parts[f'weighted_{name}'] = val
@@ -908,22 +982,36 @@ def select_queries_active_coverage(env:GridWorld, mmp:MultiMetricProgression, VQ
 
 def evaluate_query_answering(model:QDIN, env:GridWorld, queries:List[Dict]):
     V,Q = compute_value_fn(env)
+    stats = {
+        'value_abs': [],
+        'q_abs': [],
+        'policy_hits': [],
+        'reach_iou': [],
+        'path_abs': [],
+        'compare_hits': [],
+    }
     correct=0; total=0
-    set_iou=[]
     for q in queries:
-        out = model(q)
+        with torch.no_grad():
+            out = model(q)
         t = q['type']
-        total+=1
+        total += 1
         if t=='value':
-            y=V[q['s']]; pred=float(out['value'].detach().cpu().view(-1)[0])
+            y = V[q['s']]
+            pred = float(out['value'].detach().cpu().view(-1)[0])
+            stats['value_abs'].append(abs(pred - y))
             ok = abs(pred - y) < 1.0
         elif t=='q':
-            y=Q[(q['s'],q['a'])]; pred=float(out['q'][q['a']].detach().cpu())
+            y = Q[(q['s'],q['a'])]
+            pred = float(out['q'][q['a']].detach().cpu())
+            stats['q_abs'].append(abs(pred - y))
             ok = abs(pred - y) < 1.0
         elif t=='policy':
             s=q['s']; best=max(ACTIONS, key=lambda a:Q[(s,a)])
             pred=int(torch.argmax(out['policy']).item())
-            ok = (pred==best)
+            hit = int(pred==best)
+            stats['policy_hits'].append(hit)
+            ok = bool(hit)
         elif t=='reachable':
             k=q.get('k',3)
             R=env.k_step_reachable(q['s'],k)
@@ -931,21 +1019,103 @@ def evaluate_query_answering(model:QDIN, env:GridWorld, queries:List[Dict]):
             pred=(out['set_logits']>0).nonzero().view(-1).tolist()
             inter=len(set(pred)&mask_true); union=len(set(pred)|mask_true) if (set(pred)|mask_true) else 1
             iou = inter/union
-            set_iou.append(iou); ok = iou>0.5
+            stats['reach_iou'].append(iou)
+            ok = iou>0.5
         elif t=='pathcost':
-            P=env.shortest_path(q['s'],q['g']) or []
-            y=float(len(P)*abs(env.cfg.step_cost)); pred=float(out['pathcost'].detach().cpu().view(-1)[0])
-            ok = abs(pred - y) < abs(env.cfg.step_cost)*2.0
+            plan = env.shortest_path(q['s'], q['g']) or []
+            y = path_cost_ground_truth(env, q['s'], plan)
+            pred = float(out['pathcost'].detach().cpu())
+            stats['path_abs'].append(abs(pred - y))
+            ok = abs(pred - y) < max(1.0, abs(env.cfg.step_cost)*2.0)
         elif t=='compare':
-            p1,p2=q['p1'],q['p2']; y=1.0 if len(p1)<len(p2) else 0.0
-            pred=(torch.sigmoid(out['policy'].mean())>0.5).float().item()
-            ok = (int(pred)==int(y))
+            p1,p2=q['p1'],q['p2']
+            true_cost_a = path_cost_ground_truth(env, q['s'], p1)
+            true_cost_b = path_cost_ground_truth(env, q['s'], p2)
+            cost_a_pred = float(out['pathcost'].detach().cpu())
+            with torch.no_grad():
+                cost_b_pred = float(model.expected_path_cost(q['s'], p2).detach().cpu())
+            pred = 0 if cost_a_pred <= cost_b_pred else 1
+            hit = int((true_cost_a <= true_cost_b and pred == 0) or (true_cost_b < true_cost_a and pred == 1))
+            stats['compare_hits'].append(hit)
+            ok = bool(hit)
         else:
             ok=False
         if ok: correct+=1
     acc = correct/max(1,total)
-    mean_iou = float(np.mean(set_iou)) if set_iou else 0.0
-    return {'acc':acc, 'set_mean_iou':mean_iou}
+    summary = {
+        'overall_acc': acc,
+        'value_mae': float(np.mean(stats['value_abs'])) if stats['value_abs'] else 0.0,
+        'q_mae': float(np.mean(stats['q_abs'])) if stats['q_abs'] else 0.0,
+        'policy_acc': float(np.mean(stats['policy_hits'])) if stats['policy_hits'] else 0.0,
+        'reach_mean_iou': float(np.mean(stats['reach_iou'])) if stats['reach_iou'] else 0.0,
+        'path_mae': float(np.mean(stats['path_abs'])) if stats['path_abs'] else 0.0,
+        'compare_acc': float(np.mean(stats['compare_hits'])) if stats['compare_hits'] else 0.0,
+    }
+    return summary
+
+
+def rollouts_control_metrics(
+    env: GridWorld,
+    greedy_action_fn,
+    q_fn=None,
+    n_episodes: int = 10,
+    max_steps: Optional[int] = None,
+    enforce_greedy: bool = True,
+):
+    max_steps = max_steps or (4 * env.cfg.H * env.cfg.W)
+    returns = []
+    shaped_returns = []
+    successes = 0
+    steps_to_goal: List[int] = []
+    for _ in range(n_episodes):
+        s = env.reset()
+        ret = 0.0
+        shaped = 0.0
+        reached = False
+        for step in range(1, max_steps + 1):
+            if s == env.cfg.goal:
+                reached = True
+                steps_to_goal.append(step - 1)
+                break
+            chosen = greedy_action_fn(s)
+            if enforce_greedy and q_fn is not None:
+                q_vals = q_fn(s)
+                if isinstance(q_vals, torch.Tensor):
+                    q_vals_cpu = q_vals.detach().cpu()
+                else:
+                    q_vals_cpu = torch.tensor(q_vals)
+                greedy = int(torch.argmax(q_vals_cpu).item())
+                if chosen != greedy:
+                    log_event("NON_GREEDY_ACTION", chosen=chosen, greedy=greedy, state=s)
+                    action = greedy
+                else:
+                    action = chosen
+            else:
+                action = chosen
+            s, r, done, _ = env.step(action)
+            ret += r
+            shaped -= 0.01
+            if done:
+                reached = True
+                shaped += 1.0
+                steps_to_goal.append(step)
+                break
+        if not reached:
+            steps_to_goal.append(max_steps)
+        if reached:
+            successes += 1
+        returns.append(ret)
+        shaped_returns.append(shaped)
+    avg_return = float(np.mean(returns)) if returns else 0.0
+    avg_shaped = float(np.mean(shaped_returns)) if shaped_returns else 0.0
+    goal_rate = successes / max(1, n_episodes)
+    env.reset()
+    return {
+        'avg_return': avg_return,
+        'avg_success_reward': avg_shaped,
+        'goal_reach_rate': goal_rate,
+        'steps_to_goal': steps_to_goal,
+    }
 
 
 # ------------------------- Baseline DQN (minimal) -------------------------
@@ -970,6 +1140,14 @@ class DQN(nn.Module):
         with torch.no_grad():
             q=self.forward(s); return int(torch.argmax(q).item())
 
+    @torch.no_grad()
+    def greedy_action(self, s: Tuple[int, int]) -> int:
+        return int(torch.argmax(self.forward(s)).item())
+
+    @torch.no_grad()
+    def q_values(self, s: Tuple[int, int]) -> torch.Tensor:
+        return self.forward(s)
+
 def train_dqn(env:GridWorld, steps=2000, lr=1e-3, gamma=0.99):
     device='cuda' if torch.cuda.is_available() else 'cpu'
     dqn=DQN(env).to(device); opt=torch.optim.Adam(dqn.parameters(), lr=lr)
@@ -978,7 +1156,7 @@ def train_dqn(env:GridWorld, steps=2000, lr=1e-3, gamma=0.99):
         a=dqn.act(s, eps=max(0.01, 1.0 - t/steps))
         s2,r,done,_=env.step(a)
         with torch.no_grad():
-            qn=dqn.forward(s2)
+            qn = dqn.forward(s2)
             y = r + (0.0 if done else gamma*torch.max(qn).item())
         qsa = dqn.forward(s)[a]
         loss = F.mse_loss(qsa, torch.tensor(y, device=device).float())
