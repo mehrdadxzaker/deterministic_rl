@@ -780,6 +780,35 @@ class MultiTaskLossBalancer(nn.Module):
         return total.squeeze(0), scaled
 
 
+class LossNormalizer:
+    """Keeps an exponential moving average of per-head losses."""
+
+    def __init__(self, names: Optional[List[str]] = None, momentum: float = 0.98, eps: float = 1e-6):
+        self.momentum = momentum
+        self.eps = eps
+        self.running: Dict[str, float] = {}
+        if names is not None:
+            for name in names:
+                self.running[name] = 0.0
+
+    def _update(self, name: str, value: float) -> float:
+        value = max(value, self.eps)
+        prev = self.running.get(name)
+        if prev is None or prev <= 0.0:
+            updated = value
+        else:
+            updated = self.momentum * prev + (1.0 - self.momentum) * value
+        self.running[name] = max(updated, self.eps)
+        return self.running[name]
+
+    def __call__(self, name: str, loss: torch.Tensor) -> torch.Tensor:
+        denom = self._update(name, float(loss.detach().item()))
+        return loss / loss.new_tensor(denom)
+
+    def ema(self, name: str) -> Optional[float]:
+        return self.running.get(name)
+
+
 def path_cost_ground_truth(env: GridWorld, start: Tuple[int, int], actions: List[int]) -> float:
     cur = start
     total = 0.0
@@ -798,7 +827,16 @@ def path_cost_ground_truth(env: GridWorld, start: Tuple[int, int], actions: List
     return float(total)
 
 
-def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:Dict[str,Any], w:LossWeights, balancer:Optional[MultiTaskLossBalancer]=None):
+def inference_aware_loss(
+    model:QDIN,
+    env:GridWorld,
+    batch_q:List[Dict],
+    targets:Dict[str,Any],
+    w:LossWeights,
+    balancer:Optional[MultiTaskLossBalancer]=None,
+    normalizer: Optional[LossNormalizer] = None,
+    normalize_rewards: bool = True,
+):
     device = next(model.parameters()).device
     bsz = len(batch_q)
     cached_outputs: List[Dict[str, torch.Tensor]] = []
@@ -806,8 +844,15 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
     type_sums: Dict[str, torch.Tensor] = {}
     type_counts: collections.Counter = collections.Counter()
     loss_logs: Dict[str, List[float]] = collections.defaultdict(list)
-    value_scale = float(max(1, 4 * env.cfg.H * env.cfg.W))
-    path_scale = float(max(1.0, abs(env.cfg.step_cost) * value_scale))
+    if normalize_rewards:
+        max_abs_v = max((abs(v) for v in targets['V'].values()), default=1.0)
+        max_abs_q = max((abs(v) for v in targets['Q'].values()), default=1.0)
+        value_scale = float(max(1.0, max(max_abs_v, max_abs_q)))
+        max_path = env.cfg.H + env.cfg.W
+        path_scale = float(max(1.0, abs(env.cfg.step_cost) * max_path + abs(env.cfg.goal_reward)))
+    else:
+        value_scale = float(max(1, 4 * env.cfg.H * env.cfg.W))
+        path_scale = float(max(1.0, abs(env.cfg.step_cost) * value_scale))
 
     for q in batch_q:
         out = model(q)
@@ -939,8 +984,14 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
         'td': loss_td,
         'model': loss_model,
     }
+    normalized_losses: Dict[str, torch.Tensor] = {}
+    if normalizer is not None:
+        for name, loss_val in losses.items():
+            normalized_losses[name] = normalizer(name, loss_val)
+    else:
+        normalized_losses = losses
     base_weights = w.as_dict()
-    active_losses = {k: v for k, v in losses.items() if base_weights.get(k, 0.0) > 0.0}
+    active_losses = {k: normalized_losses.get(k, v) for k, v in losses.items() if base_weights.get(k, 0.0) > 0.0}
     if balancer is not None and active_losses:
         total_loss, scaled_parts = balancer.combine(active_losses, base_weights)
     else:
@@ -973,6 +1024,14 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
             parts[f'loss_{name}_mean'] = float(np.mean(values))
     for name, val in scaled_parts.items():
         parts[f'weighted_{name}'] = val
+    if normalizer is not None:
+        for name in losses.keys():
+            ema_val = normalizer.ema(name)
+            if ema_val is not None:
+                parts[f'ema_{name}'] = float(ema_val)
+            norm_val = normalized_losses.get(name)
+            if norm_val is not None:
+                parts[f'norm_{name}'] = float(norm_val.detach().item())
     if not torch.isfinite(total_loss):
         diag = {k: float(v.detach().item()) if torch.is_tensor(v) else float(v) for k, v in losses.items()}
         diag.update({f'scaled_{k}': v for k, v in scaled_parts.items()})
@@ -1157,6 +1216,51 @@ def unit_test_optimal_action_execution(env: GridWorld, model: Optional[QDIN] = N
         'goal_rate_gt': goal_rate_gt,
         'goal_rate_model': goal_rate_model,
     }
+
+
+def unit_test_value_scaling() -> Dict[str, float]:
+    """Verify that value/Q magnitudes align with analytic expectations on a 5x5 grid."""
+    cfg = GridConfig(H=5, W=5, start=(0, 0), goal=(4, 4), step_cost=-1.0, goal_reward=0.0, seed=13)
+    env = GridWorld(cfg)
+    gamma = 0.99
+    V, Q = compute_value_fn(env, gamma=gamma)
+
+    def expected_value(distance: int) -> float:
+        if distance <= 0:
+            return 0.0
+        # Closed-form sum for deterministic negative step cost.
+        return cfg.step_cost * (1.0 - gamma ** distance) / (1.0 - gamma)
+
+    value_errors: List[float] = []
+    q_errors: List[float] = []
+
+    for state in env._all_states:
+        plan = env.shortest_path(state, cfg.goal)
+        distance = len(plan) if plan is not None else 0
+        target_v = expected_value(distance)
+        value_errors.append(abs(V[state] - target_v))
+        for action in ACTIONS:
+            q_val = Q.get((state, action), -1e9)
+            if q_val < -1e8:
+                continue
+            next_state = env.deterministic_move(state, action)
+            plan_next = env.shortest_path(next_state, cfg.goal)
+            next_distance = len(plan_next) if plan_next is not None else 0
+            reward = cfg.step_cost
+            if next_state == cfg.goal:
+                reward += cfg.goal_reward
+            target_q = reward + gamma * expected_value(next_distance)
+            q_errors.append(abs(q_val - target_q))
+
+    max_v_err = max(value_errors) if value_errors else 0.0
+    max_q_err = max(q_errors) if q_errors else 0.0
+    log_event("UNITTEST_VALUE_SCALE", max_v_err=max_v_err, max_q_err=max_q_err)
+    tol = 5e-3
+    if max_v_err > tol or max_q_err > tol:
+        raise AssertionError(
+            f"Value/Q magnitudes deviate from analytic expectations (V err={max_v_err:.4f}, Q err={max_q_err:.4f})"
+        )
+    return {'max_v_err': max_v_err, 'max_q_err': max_q_err}
 
 
 # ------------------------- Evaluation metrics -------------------------
