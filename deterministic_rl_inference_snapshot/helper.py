@@ -849,8 +849,16 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
             pos = mask.sum()
             neg = mask.numel() - pos
             pos_weight = ((neg + 1.0) / (pos + 1.0)).to(device)
-            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight, label_smoothing=0.05)
-            reach_loss = criterion(pred, mask)
+            # ``label_smoothing`` is only available in newer versions of PyTorch.  For
+            # compatibility with older versions (which are used in some of the
+            # experiments), we manually smooth the targets before computing the
+            # loss.  This mirrors the behaviour of ``label_smoothing`` in
+            # ``BCEWithLogitsLoss`` by moving positive labels towards
+            # ``1 - eps`` and negative labels towards ``eps``.
+            label_smoothing = 0.05
+            smoothed_mask = mask * (1 - label_smoothing) + (1 - mask) * label_smoothing
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            reach_loss = criterion(pred, smoothed_mask)
             loss_item = REACH_LOSS_SCALE * reach_loss
         elif t == 'pathcost':
             plan = targets['oracle_plan'](q)
