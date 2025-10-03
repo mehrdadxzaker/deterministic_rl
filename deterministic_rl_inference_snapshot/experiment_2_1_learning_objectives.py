@@ -23,6 +23,7 @@ def train_mode(env, mode:str, episodes:int=600, seed:int=0):
         raise ValueError("Unknown mode")
 
     balancer = MultiTaskLossBalancer([k for k,v in w.as_dict().items() if v>0]).to(device)
+    normalizer = LossNormalizer(['td','inf','explic','model'])
     params = list(model.parameters()) + list(balancer.parameters())
     opt = torch.optim.Adam(params, lr=5e-4)
 
@@ -33,14 +34,30 @@ def train_mode(env, mode:str, episodes:int=600, seed:int=0):
     for ep in range(episodes):
         phase, progress = curriculum_phase(ep, episodes)
         batch = select_queries_active_coverage(env, mmp, (gt['V'],gt['Q']), batch_size=24, phase=phase, phase_progress=progress)
-        loss, parts = inference_aware_loss(model, env, batch, gt, w, balancer=balancer)
-        log_payload = {k: parts[k] for k in parts if k.startswith('loss_') or k.startswith('count_')}
+        loss, parts = inference_aware_loss(
+            model,
+            env,
+            batch,
+            gt,
+            w,
+            balancer=balancer,
+            normalizer=normalizer,
+            normalize_rewards=True,
+        )
+        log_payload = {
+            k: parts[k]
+            for k in parts
+            if k.startswith(('loss_', 'count_', 'ema_', 'norm_', 'weighted_'))
+        }
         log_payload['entropy'] = parts.get('entropy', 0.0)
         log_event("EPOCH_LOSS", epoch=ep + 1, mode=mode, **log_payload)
         if loss is None:
             log_event("SKIP_UPDATE_NON_FINITE", epoch=ep + 1, mode=mode)
             continue
-        opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        opt.step()
 
         if (ep+1)%100==0:
             # inference metrics

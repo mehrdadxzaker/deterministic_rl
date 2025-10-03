@@ -17,6 +17,7 @@ def run_experiment_7_1(grid_size=8, n_obstacles=8, episodes=600, seed=0):
     qdin = QDIN(env).to(device)
     w = LossWeights(td=0.1, inf=1.0, explic=0.05, model=0.25)
     balancer = MultiTaskLossBalancer([k for k,v in w.as_dict().items() if v>0]).to(device)
+    normalizer = LossNormalizer(['td','inf','explic','model'])
     params = list(qdin.parameters()) + list(balancer.parameters())
     opt = torch.optim.Adam(params, lr=5e-4)
 
@@ -24,14 +25,30 @@ def run_experiment_7_1(grid_size=8, n_obstacles=8, episodes=600, seed=0):
     for ep in range(episodes):
         phase, progress = curriculum_phase(ep, episodes)
         batch = select_queries_active_coverage(env, mmp, (gt['V'],gt['Q']), batch_size=24, phase=phase, phase_progress=progress)
-        loss, parts = inference_aware_loss(qdin, env, batch, gt, w, balancer=balancer)
-        log_payload = {k: parts[k] for k in parts if k.startswith('loss_') or k.startswith('count_')}
+        loss, parts = inference_aware_loss(
+            qdin,
+            env,
+            batch,
+            gt,
+            w,
+            balancer=balancer,
+            normalizer=normalizer,
+            normalize_rewards=True,
+        )
+        log_payload = {
+            k: parts[k]
+            for k in parts
+            if k.startswith(('loss_', 'count_', 'ema_', 'norm_', 'weighted_'))
+        }
         log_payload['entropy'] = parts.get('entropy', 0.0)
         log_event("EPOCH_LOSS", epoch=ep + 1, mode='arch', **log_payload)
         if loss is None:
             log_event("SKIP_UPDATE_NON_FINITE", epoch=ep + 1, mode='arch')
             continue
-        opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(qdin.parameters(), 1.0); opt.step()
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        opt.step()
         if (ep+1)%100==0:
             # evaluate
             test_q = select_queries_active_coverage(env, mmp, (gt['V'],gt['Q']), batch_size=60, phase="full", phase_progress=1.0)
