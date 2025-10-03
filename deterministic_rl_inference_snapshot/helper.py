@@ -7,7 +7,7 @@
 
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any, Optional
-import math, random, itertools, collections
+import math, random, itertools, collections, copy
 
 import numpy as np
 
@@ -68,6 +68,7 @@ class GridWorld:
         # map state <-> index
         self.s2i = {s:i for i,s in enumerate(self._all_states)}
         self.i2s = {i:s for s,i in self.s2i.items()}
+        self.room_ids, self.num_rooms = self._compute_room_ids()
 
     def reset(self, state:Optional[Tuple[int,int]]=None):
         self.state = state if state is not None else self.start
@@ -89,6 +90,13 @@ class GridWorld:
         if done:
             rwd += self.cfg.goal_reward
         return nxt, rwd, done, {}
+
+    def deterministic_move(self, state:Tuple[int,int], a:Action) -> Tuple[int,int]:
+        dr, dc = ACTION_VECS[a]
+        nr, nc = state[0] + dr, state[1] + dc
+        if self.in_bounds(nr, nc) and (nr, nc) not in self.walls:
+            return (nr, nc)
+        return state
 
     def neighbors(self, s):
         r,c = s
@@ -137,6 +145,23 @@ class GridWorld:
             R |= newf
             frontier = newf
         return R
+
+    def _compute_room_ids(self) -> Tuple[Dict[Tuple[int, int], int], int]:
+        labels: Dict[Tuple[int, int], int] = {}
+        room_id = 0
+        for s in self._all_states:
+            if s in labels:
+                continue
+            queue = collections.deque([s])
+            labels[s] = room_id
+            while queue:
+                u = queue.popleft()
+                for _, v in self.neighbors(u):
+                    if v not in labels:
+                        labels[v] = room_id
+                        queue.append(v)
+            room_id += 1
+        return labels, room_id
 
 
 # ------------------------- Ground-truth values via dynamic programming -------------------------
@@ -447,6 +472,13 @@ class QDIN(nn.Module):
         self._cached_grid_feat: Optional[torch.Tensor] = None
         self._cached_grid_device: Optional[torch.device] = None
 
+        room_ids = [self.env.room_ids[s] for s in env._all_states]
+        num_rooms = max(1, env.num_rooms)
+        self.register_buffer('room_ids', torch.tensor(room_ids, dtype=torch.long))
+        self.room_embed = nn.Embedding(num_rooms, hidden)
+        self.room_gate = nn.Linear(hidden, 2)
+        self._room_gate_cache: Optional[torch.Tensor] = None
+
         # query embeddings: type id + a small numeric vector
         self.type2id = {'value':0,'q':1,'policy':2,'reachable':3,'pathcost':4,'compare':5}
         self.embed_t = nn.Embedding(len(self.type2id), hidden)
@@ -488,13 +520,20 @@ class QDIN(nn.Module):
         # Heads
         self.h_value = nn.Linear(hidden, 1)
         self.h_q = nn.Linear(hidden, self.A)
-        self.h_policy = nn.Linear(hidden, self.A)
         self.h_explic = nn.Linear(hidden, 1)
         self.log_explic_temp = nn.Parameter(torch.zeros(1))
 
-        for head in [self.h_value, self.h_q, self.h_policy, self.h_explic]:
+        for head in [self.h_value, self.h_q, self.h_explic]:
             nn.init.normal_(head.weight, mean=0.0, std=0.01)
             nn.init.constant_(head.bias, 0.0)
+
+    def _room_gate_values(self, device: torch.device) -> Optional[torch.Tensor]:
+        if self.room_ids.numel() == 0:
+            return None
+        room_ids = self.room_ids.to(device)
+        room_feat = self.room_embed(room_ids)
+        gates = torch.sigmoid(self.room_gate(room_feat))
+        return gates
 
     def transition_matrix(self):
         device = self.T_logits.device
@@ -505,7 +544,16 @@ class QDIN(nn.Module):
                 continue
             idxs = self.neighbor_idx[s_idx, :count]
             T_logits[:, s_idx, idxs] = self.T_logits[:, s_idx, :count]
-        return torch.softmax(T_logits, dim=-1)
+        T = torch.softmax(T_logits, dim=-1)
+        gate_vals = self._room_gate_values(device)
+        if gate_vals is not None:
+            stay = torch.eye(self.S, device=device).unsqueeze(0)
+            trans_gate = gate_vals[:, 0].view(1, self.S, 1)
+            T = trans_gate * T + (1.0 - trans_gate) * stay
+            self._room_gate_cache = gate_vals
+        else:
+            self._room_gate_cache = None
+        return T
 
     def reachability_from_T(self, T:torch.Tensor, s:Tuple[int,int], k:int):
         device = T.device
@@ -521,6 +569,12 @@ class QDIN(nn.Module):
         T = self.transition_matrix()  # [A,S,S]
         R = self.R  # [S,A]
         V = torch.zeros(self.S, device=R.device)
+        gate_vals = self._room_gate_cache
+        if gate_vals is None or gate_vals.device != R.device:
+            gate_vals = self._room_gate_values(R.device)
+        if gate_vals is not None:
+            reward_gate = gate_vals[:, 1].view(self.S, 1)
+            R = R * (0.5 + reward_gate)
         for _ in range(self.K):
             Q = R + gamma * torch.einsum('ask,k->sa', T, V)  # [S,A]
             V = torch.max(Q, dim=1).values
@@ -534,21 +588,48 @@ class QDIN(nn.Module):
         state_dist = torch.zeros(self.S, device=device)
         state_dist[self.state_idx[start]] = 1.0
         total_cost = torch.zeros(1, device=device)
+        gate_vals = self._room_gate_cache
+        if gate_vals is None or gate_vals.device != device:
+            gate_vals = self._room_gate_values(device)
+        if gate_vals is not None:
+            reward_gate = gate_vals[:, 1].view(self.S, 1)
+            rewards = self.R * (0.5 + reward_gate)
+        else:
+            rewards = self.R
         for a in actions:
             a = int(a)
-            reward = torch.matmul(state_dist, self.R[:, a])
+            reward = torch.matmul(state_dist, rewards[:, a])
             total_cost = total_cost - reward
             state_dist = torch.matmul(state_dist, T[a])
         return total_cost.squeeze(0)
 
+    def simulate_action_costs(self, s: Tuple[int, int], T: torch.Tensor) -> torch.Tensor:
+        costs: List[torch.Tensor] = []
+        penalty = float(max(1.0, abs(self.env.cfg.step_cost) * 4 * self.env.cfg.H * self.env.cfg.W))
+        device = T.device
+        for a in ACTIONS:
+            tail_start = self.env.deterministic_move(s, a)
+            tail = self.env.shortest_path(tail_start, self.env.cfg.goal) or []
+            if tail or tail_start == self.env.cfg.goal:
+                plan = [a] + tail
+                cost = self.expected_path_cost(s, plan, T)
+            else:
+                cost = torch.tensor(penalty, device=device)
+            costs.append(cost.view(1))
+        return torch.cat(costs, dim=0)
+
     @torch.no_grad()
     def greedy_action(self, s: Tuple[int, int]) -> int:
-        q_vals = self({'type': 'q', 's': s})['q']
-        return int(torch.argmax(q_vals).item())
+        logits = self({'type': 'policy', 's': s})['policy']
+        return int(torch.argmax(logits).item())
 
     @torch.no_grad()
     def q_values(self, s: Tuple[int, int]) -> torch.Tensor:
         return self({'type': 'q', 's': s})['q']
+
+    @torch.no_grad()
+    def policy_logits(self, s: Tuple[int, int]) -> torch.Tensor:
+        return self({'type': 'policy', 's': s})['policy']
 
     def encode_query(self, q:Dict[str,Any]):
         # numeric features: s_idx, a, k, g_idx_r, g_idx_c (if provided)
@@ -624,7 +705,8 @@ class QDIN(nn.Module):
         out = {}
         out['value'] = self.h_value(x).squeeze(0)          # [1]
         out['q'] = self.h_q(x).squeeze(0)                  # [A]
-        out['policy'] = self.h_policy(x).squeeze(0)        # [A]
+        policy_logits = -self.simulate_action_costs(s, T_all)
+        out['policy'] = policy_logits
         k = q.get('k', 3)
         reach_probs = self.reachability_from_T(T_all, s, k)
         reach_logits = torch.logit(reach_probs.clamp(1e-6, 1-1e-6))
@@ -698,10 +780,6 @@ class MultiTaskLossBalancer(nn.Module):
         return total.squeeze(0), scaled
 
 
-def _smooth_binary_targets(target: torch.Tensor, eps: float = 0.05) -> torch.Tensor:
-    return target * (1.0 - eps) + 0.5 * eps
-
-
 def path_cost_ground_truth(env: GridWorld, start: Tuple[int, int], actions: List[int]) -> float:
     cur = start
     total = 0.0
@@ -725,51 +803,79 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
     bsz = len(batch_q)
     cached_outputs: List[Dict[str, torch.Tensor]] = []
     loss_inf = torch.tensor(0.0, device=device)
+    type_sums: Dict[str, torch.Tensor] = {}
+    type_counts: collections.Counter = collections.Counter()
+    loss_logs: Dict[str, List[float]] = collections.defaultdict(list)
+    value_scale = float(max(1, 4 * env.cfg.H * env.cfg.W))
+    path_scale = float(max(1.0, abs(env.cfg.step_cost) * value_scale))
+
     for q in batch_q:
         out = model(q)
         cached_outputs.append(out)
         t = q['type']
-        if t=='value':
+        type_counts[t] += 1
+        if t == 'value':
             y = torch.tensor([targets['V'][q['s']]], device=device).float()
-            loss_inf = loss_inf + F.mse_loss(out['value'].view_as(y), y)
-        elif t=='q':
-            y = torch.tensor([targets['Q'][(q['s'],q['a'])]], device=device).float()
-            qsa = out['q'][q['a']]
-            loss_inf = loss_inf + F.mse_loss(qsa.view_as(y), y)
-        elif t=='policy':
-            s=q['s']
-            best = max(ACTIONS, key=lambda a: targets['Q'][(s,a)])
+            pred = out['value'].view_as(y) / value_scale
+            target = y / value_scale
+            loss_item = F.smooth_l1_loss(pred, target)
+        elif t == 'q':
+            y = torch.tensor([targets['Q'][(q['s'], q['a'])]], device=device).float()
+            qsa = out['q'][q['a']].view_as(y) / value_scale
+            loss_item = F.smooth_l1_loss(qsa, y / value_scale)
+        elif t == 'policy':
+            s = q['s']
+            costs = []
+            for a in ACTIONS:
+                nxt = env.deterministic_move(s, a)
+                tail = env.shortest_path(nxt, env.cfg.goal)
+                if tail is None:
+                    cost = path_scale * 2.0
+                else:
+                    plan = [a] + tail
+                    cost = path_cost_ground_truth(env, s, plan)
+                costs.append((a, cost))
+            best = min(costs, key=lambda x: x[1])[0]
             logits = out['policy'].unsqueeze(0)
             y = torch.tensor([best], device=device).long()
-            loss_inf = loss_inf + F.cross_entropy(logits, y)
-        elif t=='reachable':
-            k=q.get('k',3)
+            loss_item = F.cross_entropy(logits, y)
+        elif t == 'reachable':
+            k = q.get('k', 3)
             R = env.k_step_reachable(q['s'], k)
             mask = torch.zeros(model.S, device=device)
-            idxs=[model.state_idx[s] for s in R]
-            mask[idxs]=1.0
+            idxs = [model.state_idx[s] for s in R]
+            mask[idxs] = 1.0
             pred = out['set_logits']
             pos = mask.sum()
             neg = mask.numel() - pos
             pos_weight = ((neg + 1.0) / (pos + 1.0)).to(device)
-            target = _smooth_binary_targets(mask, eps=0.05)
-            reach_loss = F.binary_cross_entropy_with_logits(pred, target, pos_weight=pos_weight)
-            loss_inf = loss_inf + REACH_LOSS_SCALE * reach_loss
-        elif t=='pathcost':
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight, label_smoothing=0.05)
+            reach_loss = criterion(pred, mask)
+            loss_item = REACH_LOSS_SCALE * reach_loss
+        elif t == 'pathcost':
             plan = targets['oracle_plan'](q)
             gt_cost = torch.tensor([path_cost_ground_truth(env, q['s'], plan)], device=device).float()
-            pred_cost = out['pathcost'].view_as(gt_cost)
-            loss_inf = loss_inf + F.mse_loss(pred_cost, gt_cost)
-        elif t=='compare':
+            pred_cost = out['pathcost'].view_as(gt_cost) / path_scale
+            loss_item = F.smooth_l1_loss(pred_cost, gt_cost / path_scale)
+        elif t == 'compare':
             p1, p2 = q['p1'], q['p2']
-            cost_a = model.expected_path_cost(q['s'], p1)
+            cost_a = out['pathcost']
             cost_b = model.expected_path_cost(q['s'], p2)
             logits = torch.stack([-cost_a, -cost_b]).unsqueeze(0)
             true_cost_a = path_cost_ground_truth(env, q['s'], p1)
             true_cost_b = path_cost_ground_truth(env, q['s'], p2)
             y = torch.tensor([0 if true_cost_a <= true_cost_b else 1], device=device).long()
-            loss_inf = loss_inf + F.cross_entropy(logits, y)
-    loss_inf = loss_inf / max(1,bsz)
+            loss_item = F.cross_entropy(logits, y)
+        else:
+            loss_item = torch.tensor(0.0, device=device)
+        loss_inf = loss_inf + loss_item
+        if t in type_sums:
+            type_sums[t] = type_sums[t] + loss_item
+        else:
+            type_sums[t] = loss_item
+        loss_logs[t].append(float(loss_item.detach().item()))
+
+    loss_inf = loss_inf / max(1, bsz)
 
     explic_targets=[]
     for q in batch_q:
@@ -792,7 +898,7 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
             y_val = r + 0.99 * bootstrap
         qsa = model({'type':'q','s':s,'a':a})['q'][a]
         y = torch.tensor(y_val, device=qsa.device, dtype=qsa.dtype)
-        loss_td = loss_td + F.mse_loss(qsa, y)
+        loss_td = loss_td + F.smooth_l1_loss(qsa / value_scale, y / value_scale)
     loss_td = loss_td / max(1, bsz//2)
 
     loss_model_T = torch.tensor(0.0, device=device)
@@ -837,11 +943,9 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
             total_loss = total_loss + weight * loss_val
             scaled_parts[name] = float((weight * loss_val).item())
 
-    if not torch.isfinite(total_loss):
-        diag = {k: float(v.detach().item()) if torch.is_tensor(v) else float(v) for k, v in losses.items()}
-        diag.update({f'scaled_{k}': v for k, v in scaled_parts.items()})
-        log_event("NON_FINITE", **diag)
-        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    count_payload = {f'n_{k}': int(v) for k, v in type_counts.items()}
+    if count_payload:
+        log_event("BATCH_QUERY_COUNTS", **count_payload)
 
     parts = dict(
         inf=float(loss_inf.item()),
@@ -852,8 +956,20 @@ def inference_aware_loss(model:QDIN, env:GridWorld, batch_q:List[Dict], targets:
         model_R=float(loss_model_R.item()),
         entropy=float(entropy.item()),
     )
+    for k, v in type_counts.items():
+        parts[f'count_{k}'] = int(v)
+        if v > 0 and k in type_sums:
+            parts[f'loss_{k}'] = float((type_sums[k] / v).detach().item())
+    for name, values in loss_logs.items():
+        if values:
+            parts[f'loss_{name}_mean'] = float(np.mean(values))
     for name, val in scaled_parts.items():
         parts[f'weighted_{name}'] = val
+    if not torch.isfinite(total_loss):
+        diag = {k: float(v.detach().item()) if torch.is_tensor(v) else float(v) for k, v in losses.items()}
+        diag.update({f'scaled_{k}': v for k, v in scaled_parts.items()})
+        log_event("NON_FINITE", **diag)
+        return None, parts
     return total_loss, parts
 
 
@@ -978,6 +1094,63 @@ def select_queries_active_coverage(env:GridWorld, mmp:MultiMetricProgression, VQ
     return stabilized[:batch_size]
 
 
+def unit_test_optimal_action_execution(env: GridWorld, model: Optional[QDIN] = None, samples: int = 100) -> Dict[str, Optional[float]]:
+    """Smoke-test optimal and learned policies on random states."""
+    cfg_copy = copy.deepcopy(env.cfg)
+    gt_env = GridWorld(cfg_copy)
+    max_steps = 4 * env.cfg.H * env.cfg.W
+    rng = random.Random(env.cfg.seed)
+
+    gt_success = 0
+    for _ in range(samples):
+        start = rng.choice(env._all_states)
+        if start == env.cfg.goal:
+            continue
+        plan = env.shortest_path(start, env.cfg.goal)
+        if not plan:
+            continue
+        gt_env.reset(start)
+        reached = False
+        for step, action in enumerate(plan, 1):
+            _, _, done, _ = gt_env.step(action)
+            if done:
+                if step <= len(plan):
+                    reached = True
+                break
+        if reached:
+            gt_success += 1
+    goal_rate_gt = gt_success / max(1, samples)
+    log_event("UNITTEST_GT_POLICY", goal_rate=goal_rate_gt)
+
+    goal_rate_model: Optional[float] = None
+    if model is not None:
+        model_env = GridWorld(copy.deepcopy(env.cfg))
+        successes = 0
+        steps: List[int] = []
+        for _ in range(samples):
+            start = rng.choice(env._all_states)
+            model_env.reset(start)
+            reached = False
+            for step in range(1, max_steps + 1):
+                action = int(model.greedy_action(model_env.state))
+                _, _, done, _ = model_env.step(action)
+                if done:
+                    successes += 1
+                    steps.append(step)
+                    reached = True
+                    break
+            if not reached:
+                steps.append(max_steps)
+        goal_rate_model = successes / max(1, samples)
+        median_steps = float(np.median(steps)) if steps else float(max_steps)
+        log_event("UNITTEST_MODEL_POLICY", goal_rate=goal_rate_model, median_steps=median_steps)
+
+    return {
+        'goal_rate_gt': goal_rate_gt,
+        'goal_rate_model': goal_rate_model,
+    }
+
+
 # ------------------------- Evaluation metrics -------------------------
 
 def evaluate_query_answering(model:QDIN, env:GridWorld, queries:List[Dict]):
@@ -990,11 +1163,13 @@ def evaluate_query_answering(model:QDIN, env:GridWorld, queries:List[Dict]):
         'path_abs': [],
         'compare_hits': [],
     }
+    counts = collections.Counter()
     correct=0; total=0
     for q in queries:
         with torch.no_grad():
             out = model(q)
         t = q['type']
+        counts[t] += 1
         total += 1
         if t=='value':
             y = V[q['s']]
@@ -1051,6 +1226,10 @@ def evaluate_query_answering(model:QDIN, env:GridWorld, queries:List[Dict]):
         'path_mae': float(np.mean(stats['path_abs'])) if stats['path_abs'] else 0.0,
         'compare_acc': float(np.mean(stats['compare_hits'])) if stats['compare_hits'] else 0.0,
     }
+    for key, value in counts.items():
+        summary[f'n_{key}'] = int(value)
+    if counts:
+        log_event("EVAL_QUERY_COUNTS", **{f'n_{k}': int(v) for k, v in counts.items()})
     return summary
 
 
@@ -1061,13 +1240,15 @@ def rollouts_control_metrics(
     n_episodes: int = 10,
     max_steps: Optional[int] = None,
     enforce_greedy: bool = True,
+    audit_limit: int = 50,
 ):
     max_steps = max_steps or (4 * env.cfg.H * env.cfg.W)
     returns = []
     shaped_returns = []
     successes = 0
     steps_to_goal: List[int] = []
-    for _ in range(n_episodes):
+    audit_steps = 0
+    for ep_idx in range(n_episodes):
         s = env.reset()
         ret = 0.0
         shaped = 0.0
@@ -1077,22 +1258,42 @@ def rollouts_control_metrics(
                 reached = True
                 steps_to_goal.append(step - 1)
                 break
-            chosen = greedy_action_fn(s)
+            chosen = int(greedy_action_fn(s))
+            greedy = None
             if enforce_greedy and q_fn is not None:
-                q_vals = q_fn(s)
-                if isinstance(q_vals, torch.Tensor):
-                    q_vals_cpu = q_vals.detach().cpu()
+                logits = q_fn(s)
+                if isinstance(logits, torch.Tensor):
+                    logits_cpu = logits.detach().cpu()
                 else:
-                    q_vals_cpu = torch.tensor(q_vals)
-                greedy = int(torch.argmax(q_vals_cpu).item())
-                if chosen != greedy:
-                    log_event("NON_GREEDY_ACTION", chosen=chosen, greedy=greedy, state=s)
-                    action = greedy
-                else:
-                    action = chosen
-            else:
-                action = chosen
+                    logits_cpu = torch.tensor(logits)
+                greedy = int(torch.argmax(logits_cpu).item())
+            action = chosen if (greedy is None or chosen == greedy) else greedy
+            expected_next = env.deterministic_move(s, action)
+            if greedy is not None and chosen != greedy:
+                log_event("NON_GREEDY_ACTION", chosen=chosen, greedy=greedy, state=s)
             s, r, done, _ = env.step(action)
+            if audit_steps < audit_limit:
+                log_event(
+                    "ACTION_AUDIT",
+                    episode=ep_idx,
+                    step=step,
+                    chosen=chosen,
+                    enforced=action,
+                    greedy=(greedy if greedy is not None else chosen),
+                    action_symbol=ACTION_NAMES[action],
+                    expected_next=expected_next,
+                    env_next=s,
+                )
+                if s != expected_next:
+                    log_event(
+                        "ACTION_MISMATCH",
+                        episode=ep_idx,
+                        step=step,
+                        expected=expected_next,
+                        observed=s,
+                        action=action,
+                    )
+                audit_steps += 1
             ret += r
             shaped -= 0.01
             if done:
@@ -1109,6 +1310,11 @@ def rollouts_control_metrics(
     avg_return = float(np.mean(returns)) if returns else 0.0
     avg_shaped = float(np.mean(shaped_returns)) if shaped_returns else 0.0
     goal_rate = successes / max(1, n_episodes)
+    log_event("ROLLOUT_SUMMARY", goal_rate=goal_rate, avg_return=avg_return, avg_shaped=avg_shaped)
+    bins = np.linspace(0, max_steps, num=6)
+    hist, edges = np.histogram(steps_to_goal, bins=bins)
+    hist_payload = {f"{int(edges[i])}-{int(edges[i+1])}": int(hist[i]) for i in range(len(hist))}
+    log_event("ROLLOUT_STEPS_HIST", **hist_payload)
     env.reset()
     return {
         'avg_return': avg_return,

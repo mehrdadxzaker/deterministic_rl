@@ -26,6 +26,12 @@ def run_experiment_1_1(grid_size=8, n_obstacles=8, episodes=600, seed=0):
         phase, progress = curriculum_phase(ep, episodes)
         batch = select_queries_active_coverage(env, mmp, (gt['V'],gt['Q']), batch_size=24, phase=phase, phase_progress=progress)
         loss, parts = inference_aware_loss(model, env, batch, gt, w, balancer=balancer)
+        log_payload = {k: parts[k] for k in parts if k.startswith('loss_') or k.startswith('count_')}
+        log_payload['entropy'] = parts.get('entropy', 0.0)
+        log_event("EPOCH_LOSS", epoch=ep + 1, **log_payload)
+        if loss is None:
+            log_event("SKIP_UPDATE_NON_FINITE", epoch=ep + 1)
+            continue
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
         if (ep+1)%100==0:
             # eval on a held-out random batch
@@ -37,6 +43,7 @@ def run_experiment_1_1(grid_size=8, n_obstacles=8, episodes=600, seed=0):
                 f"acc={metrics['overall_acc']:.3f} pol={metrics['policy_acc']:.3f} "
                 f"IoU={metrics['reach_mean_iou']:.3f} pathMAE={metrics['path_mae']:.3f}"
             )
+    unit_test_optimal_action_execution(env, model)
     summary = tracker.summary()
     print("[E1.1] Summary:", summary)
     return summary

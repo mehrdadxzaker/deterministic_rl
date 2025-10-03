@@ -34,6 +34,12 @@ def train_mode(env, mode:str, episodes:int=600, seed:int=0):
         phase, progress = curriculum_phase(ep, episodes)
         batch = select_queries_active_coverage(env, mmp, (gt['V'],gt['Q']), batch_size=24, phase=phase, phase_progress=progress)
         loss, parts = inference_aware_loss(model, env, batch, gt, w, balancer=balancer)
+        log_payload = {k: parts[k] for k in parts if k.startswith('loss_') or k.startswith('count_')}
+        log_payload['entropy'] = parts.get('entropy', 0.0)
+        log_event("EPOCH_LOSS", epoch=ep + 1, mode=mode, **log_payload)
+        if loss is None:
+            log_event("SKIP_UPDATE_NON_FINITE", epoch=ep + 1, mode=mode)
+            continue
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
 
         if (ep+1)%100==0:
@@ -43,7 +49,7 @@ def train_mode(env, mode:str, episodes:int=600, seed:int=0):
             metrics_qdin = rollouts_control_metrics(
                 env,
                 greedy_action_fn=lambda s: model.greedy_action(s),
-                q_fn=lambda s: model.q_values(s),
+                q_fn=lambda s: model.policy_logits(s),
                 n_episodes=20,
             )
             metrics_dqn = rollouts_control_metrics(
@@ -75,6 +81,7 @@ def train_mode(env, mode:str, episodes:int=600, seed:int=0):
                 f"R_qdin={metrics_qdin['avg_return']:.1f} (succ={metrics_qdin['goal_reach_rate']*100:.1f}%) "
                 f"R_dqn={metrics_dqn['avg_return']:.1f} (succ={metrics_dqn['goal_reach_rate']*100:.1f}%)"
             )
+    unit_test_optimal_action_execution(env, model)
     return tracker.summary()
 
 def run_experiment_2_1(grid_size=8, n_obstacles=8, episodes=600, seed=0):
