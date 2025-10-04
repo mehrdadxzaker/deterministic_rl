@@ -709,7 +709,7 @@ class QDIN(nn.Module):
         grid_feat = self._get_grid_features()[:, :, r, c]
         return base + coord_feat + grid_feat  # [1,hidden]
 
-    def forward(self, q:Dict[str,Any]):
+    def forward(self, query: Dict[str, Any]):
         device = next(self.parameters()).device
         # run VI block to get global value landscape
         V_all, Q_all, T_all = self.vi_block()
@@ -717,9 +717,9 @@ class QDIN(nn.Module):
         Q_all = Q_all.unsqueeze(0)        # [1,S,A]
 
         # get state and query encodings
-        s = q.get('s', self.env.cfg.start)
+        s = query.get('s', self.env.cfg.start)
         s_emb = self.encode_state(s).to(device)    # [1,hidden]
-        q_emb = self.encode_query(q).to(device)    # [1,hidden]
+        q_emb = self.encode_query(query).to(device)    # [1,hidden]
 
         # gather V,Q at s
         si = self.state_idx[s]
@@ -735,20 +735,20 @@ class QDIN(nn.Module):
         out['value'] = self.h_value(x).squeeze(0)          # [1]
         q_val = self.h_q_value(x)
         q_adv = self.h_q_adv(x)
-        q = q_val + q_adv - q_adv.mean(dim=1, keepdim=True)
-        out['q'] = q.squeeze(0)                  # [A]
+        q_values = q_val + q_adv - q_adv.mean(dim=1, keepdim=True)
+        out['q'] = q_values.squeeze(0)                  # [A]
         policy_logits = -self.simulate_action_costs(s, T_all)
         out['policy'] = policy_logits
-        k = q.get('k', 3)
+        k = query.get('k', 3)
         reach_probs = self.reachability_from_T(T_all, s, k)
         reach_logits = torch.logit(reach_probs.clamp(1e-6, 1-1e-6))
         out['set_logits'] = reach_logits                  # [S]
-        path_actions = q.get('path_actions')
+        path_actions = query.get('path_actions')
         if path_actions is None:
-            if q['type'] == 'pathcost':
-                path_actions = self.env.shortest_path(s, q.get('g', self.env.cfg.goal)) or []
-            elif q['type'] == 'compare':
-                path_actions = q.get('p1', [])
+            if query['type'] == 'pathcost':
+                path_actions = self.env.shortest_path(s, query.get('g', self.env.cfg.goal)) or []
+            elif query['type'] == 'compare':
+                path_actions = query.get('p1', [])
             else:
                 path_actions = []
         path_cost = self.expected_path_cost(s, path_actions, T_all)
