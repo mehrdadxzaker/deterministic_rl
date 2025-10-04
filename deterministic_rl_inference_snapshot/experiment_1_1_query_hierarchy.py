@@ -18,6 +18,11 @@ def run_experiment_1_1(grid_size=8, n_obstacles=8, episodes=600, seed=0):
     w = LossWeights(td=0.1, inf=1.0, explic=0.05, model=0.25)
     balancer = MultiTaskLossBalancer([k for k,v in w.as_dict().items() if v>0]).to(device)
     normalizer = LossNormalizer(['td','inf','explic','model'])
+    target_model = QDIN(env, hidden=128, K=5).to(device)
+    target_model.load_state_dict(model.state_dict())
+    target_model.eval()
+    tau = 0.01
+
     params = list(model.parameters()) + list(balancer.parameters())
     opt = torch.optim.Adam(params, lr=5e-4)
     mmp = MultiMetricProgression(env, V=gt['V'])
@@ -35,6 +40,9 @@ def run_experiment_1_1(grid_size=8, n_obstacles=8, episodes=600, seed=0):
             balancer=balancer,
             normalizer=normalizer,
             normalize_rewards=True,
+            target_model=target_model,
+            gamma=0.99,
+            td_target_clip=10.0,
         )
         log_payload = {
             k: parts[k]
@@ -50,6 +58,9 @@ def run_experiment_1_1(grid_size=8, n_obstacles=8, episodes=600, seed=0):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
+        with torch.no_grad():
+            for tgt_param, src_param in zip(target_model.parameters(), model.parameters()):
+                tgt_param.data.lerp_(src_param.data, tau)
         if (ep+1)%100==0:
             # eval on a held-out random batch
             test_q = select_queries_active_coverage(env, mmp, (gt['V'],gt['Q']), batch_size=40, phase="full", phase_progress=1.0)

@@ -98,6 +98,19 @@ class GridWorld:
             return (nr, nc)
         return state
 
+    def valid_actions(self, state: Tuple[int, int]) -> List[Action]:
+        """Return actions that move the agent or are permitted at terminal states."""
+        valid: List[Action] = []
+        is_terminal = (state == self.cfg.goal)
+        for a in ACTIONS:
+            nxt = self.deterministic_move(state, a)
+            if is_terminal or nxt != state:
+                valid.append(a)
+        if not valid:
+            # Fallback to at least one action so policies remain well-defined.
+            valid.append(ACTIONS[0])
+        return valid
+
     def neighbors(self, s):
         r,c = s
         for a in ACTIONS:
@@ -519,7 +532,8 @@ class QDIN(nn.Module):
 
         # Heads
         self.h_value = nn.Linear(hidden, 1)
-        self.h_q = nn.Linear(hidden, self.A)
+        self.h_q_value = nn.Linear(hidden, 1)
+        self.h_q_adv = nn.Linear(hidden, self.A)
         self.h_explic = nn.Linear(hidden, 1)
         self.log_explic_temp = nn.Parameter(torch.zeros(1))
 
@@ -618,18 +632,33 @@ class QDIN(nn.Module):
             costs.append(cost.view(1))
         return torch.cat(costs, dim=0)
 
+    def _valid_action_mask(self, s: Tuple[int, int], device: torch.device) -> torch.Tensor:
+        mask = torch.full((self.A,), float('-inf'), device=device)
+        for a in self.env.valid_actions(s):
+            mask[a] = 0.0
+        return mask
+
     @torch.no_grad()
     def greedy_action(self, s: Tuple[int, int]) -> int:
         logits = self({'type': 'policy', 's': s})['policy']
-        return int(torch.argmax(logits).item())
+        device = logits.device if isinstance(logits, torch.Tensor) else torch.device('cpu')
+        mask = self._valid_action_mask(s, device)
+        if not isinstance(logits, torch.Tensor):
+            logits = torch.tensor(logits, device=device)
+        masked = logits + mask
+        return int(torch.argmax(masked).item())
 
     @torch.no_grad()
     def q_values(self, s: Tuple[int, int]) -> torch.Tensor:
-        return self({'type': 'q', 's': s})['q']
+        q = self({'type': 'q', 's': s})['q']
+        mask = self._valid_action_mask(s, q.device)
+        return q + mask
 
     @torch.no_grad()
     def policy_logits(self, s: Tuple[int, int]) -> torch.Tensor:
-        return self({'type': 'policy', 's': s})['policy']
+        logits = self({'type': 'policy', 's': s})['policy']
+        mask = self._valid_action_mask(s, logits.device)
+        return logits + mask
 
     def encode_query(self, q:Dict[str,Any]):
         # numeric features: s_idx, a, k, g_idx_r, g_idx_c (if provided)
@@ -704,7 +733,10 @@ class QDIN(nn.Module):
 
         out = {}
         out['value'] = self.h_value(x).squeeze(0)          # [1]
-        out['q'] = self.h_q(x).squeeze(0)                  # [A]
+        q_val = self.h_q_value(x)
+        q_adv = self.h_q_adv(x)
+        q = q_val + q_adv - q_adv.mean(dim=1, keepdim=True)
+        out['q'] = q.squeeze(0)                  # [A]
         policy_logits = -self.simulate_action_costs(s, T_all)
         out['policy'] = policy_logits
         k = q.get('k', 3)
@@ -836,6 +868,9 @@ def inference_aware_loss(
     balancer:Optional[MultiTaskLossBalancer]=None,
     normalizer: Optional[LossNormalizer] = None,
     normalize_rewards: bool = True,
+    target_model: Optional[QDIN] = None,
+    gamma: float = 0.99,
+    td_target_clip: float = 10.0,
 ):
     device = next(model.parameters()).device
     bsz = len(batch_q)
@@ -850,9 +885,14 @@ def inference_aware_loss(
         value_scale = float(max(1.0, max(max_abs_v, max_abs_q)))
         max_path = env.cfg.H + env.cfg.W
         path_scale = float(max(1.0, abs(env.cfg.step_cost) * max_path + abs(env.cfg.goal_reward)))
+        reward_scale = float(max(1.0, abs(env.cfg.step_cost) + abs(env.cfg.goal_reward)))
     else:
         value_scale = float(max(1, 4 * env.cfg.H * env.cfg.W))
         path_scale = float(max(1.0, abs(env.cfg.step_cost) * value_scale))
+        reward_scale = float(max(1.0, abs(env.cfg.step_cost)))
+
+    if target_model is None:
+        target_model = model
 
     for q in batch_q:
         out = model(q)
@@ -940,18 +980,24 @@ def inference_aware_loss(
     loss_explic = F.mse_loss(explic_preds, explic_targets)
 
     loss_td = torch.tensor(0.0, device=device)
+    td_targets: List[float] = []
     for _ in range(max(1, bsz//2)):
         s = random.choice(env._all_states)
         a = random.choice(ACTIONS)
         env.state = s
         s2, r, done, _ = env.step(a)
         with torch.no_grad():
-            qn = model({'type':'q','s':s2})['q']
-            bootstrap = 0.0 if done else torch.max(qn).item()
-            y_val = r + 0.99 * bootstrap
-        qsa = model({'type':'q','s':s,'a':a})['q'][a]
-        y = torch.tensor(y_val, device=qsa.device, dtype=qsa.dtype)
-        loss_td = loss_td + F.smooth_l1_loss(qsa / value_scale, y / value_scale)
+            r_norm = max(-1.0, min(1.0, float(r) / reward_scale))
+            q_online_next = model({'type': 'q', 's': s2})['q']
+            best_next = int(torch.argmax(q_online_next).item())
+            q_target_next = target_model({'type': 'q', 's': s2})['q']
+            bootstrap = 0.0 if done else float(q_target_next[best_next].item() / value_scale)
+            target_val = r_norm + (0.0 if done else gamma * bootstrap)
+            target_val = float(np.clip(target_val, -td_target_clip, td_target_clip))
+        qsa = model({'type':'q','s':s,'a':a})['q'][a] / value_scale
+        y = torch.tensor(target_val, device=qsa.device, dtype=qsa.dtype)
+        loss_td = loss_td + F.smooth_l1_loss(qsa, y)
+        td_targets.append(target_val)
     loss_td = loss_td / max(1, bsz//2)
 
     loss_model_T = torch.tensor(0.0, device=device)
@@ -1022,6 +1068,7 @@ def inference_aware_loss(
     for name, values in loss_logs.items():
         if values:
             parts[f'loss_{name}_mean'] = float(np.mean(values))
+            parts[f'loss_{name}_var'] = float(np.var(values))
     for name, val in scaled_parts.items():
         parts[f'weighted_{name}'] = val
     if normalizer is not None:
@@ -1032,6 +1079,9 @@ def inference_aware_loss(
             norm_val = normalized_losses.get(name)
             if norm_val is not None:
                 parts[f'norm_{name}'] = float(norm_val.detach().item())
+    if td_targets:
+        parts['td_target_mean'] = float(np.mean(td_targets))
+        parts['td_target_var'] = float(np.var(td_targets))
     if not torch.isfinite(total_loss):
         diag = {k: float(v.detach().item()) if torch.is_tensor(v) else float(v) for k, v in losses.items()}
         diag.update({f'scaled_{k}': v for k, v in scaled_parts.items()})
@@ -1371,6 +1421,21 @@ def rollouts_control_metrics(
                 steps_to_goal.append(step - 1)
                 break
             chosen = int(greedy_action_fn(s))
+            valid_actions = env.valid_actions(s)
+            if chosen not in valid_actions:
+                if q_fn is not None:
+                    logits = q_fn(s)
+                    if isinstance(logits, torch.Tensor):
+                        logits_tensor = logits.detach().cpu()
+                    else:
+                        logits_tensor = torch.tensor(logits)
+                    mask = torch.full_like(logits_tensor, float('-inf'))
+                    for a in valid_actions:
+                        mask[a] = 0.0
+                    logits_tensor = logits_tensor + mask
+                    chosen = int(torch.argmax(logits_tensor).item())
+                else:
+                    chosen = valid_actions[0]
             greedy = None
             if enforce_greedy and q_fn is not None:
                 logits = q_fn(s)
@@ -1378,6 +1443,10 @@ def rollouts_control_metrics(
                     logits_cpu = logits.detach().cpu()
                 else:
                     logits_cpu = torch.tensor(logits)
+                mask = torch.full_like(logits_cpu, float('-inf'))
+                for a in valid_actions:
+                    mask[a] = 0.0
+                logits_cpu = logits_cpu + mask
                 greedy = int(torch.argmax(logits_cpu).item())
             action = chosen if (greedy is None or chosen == greedy) else greedy
             expected_next = env.deterministic_move(s, action)
@@ -1444,41 +1513,64 @@ class DQN(nn.Module):
         self.env=env
         self.S=len(env._all_states); self.A=4
         self.embed = nn.Embedding(self.S, hidden)
-        self.head = nn.Linear(hidden, self.A)
+        self.value_head = nn.Linear(hidden, 1)
+        self.adv_head = nn.Linear(hidden, self.A)
         self.s2i = {s:i for i,s in enumerate(env._all_states)}
 
     def forward(self, s):
         idx=torch.tensor([self.s2i[s]]).long().to(next(self.parameters()).device)
         x=self.embed(idx); x=torch.tanh(x)
-        return self.head(x).squeeze(0)
+        value = self.value_head(x)
+        adv = self.adv_head(x)
+        q = value + adv - adv.mean(dim=1, keepdim=True)
+        return q.squeeze(0)
 
     def act(self, s, eps=0.1):
         if random.random()<eps:
-            return random.choice(ACTIONS)
+            return random.choice(self.env.valid_actions(s))
         with torch.no_grad():
-            q=self.forward(s); return int(torch.argmax(q).item())
+            q=self.q_values(s)
+            return int(torch.argmax(q).item())
 
     @torch.no_grad()
     def greedy_action(self, s: Tuple[int, int]) -> int:
-        return int(torch.argmax(self.forward(s)).item())
+        q = self.q_values(s)
+        return int(torch.argmax(q).item())
 
     @torch.no_grad()
     def q_values(self, s: Tuple[int, int]) -> torch.Tensor:
-        return self.forward(s)
+        q = self.forward(s)
+        mask = torch.full_like(q, float('-inf'))
+        for a in self.env.valid_actions(s):
+            mask[a] = 0.0
+        return q + mask
 
-def train_dqn(env:GridWorld, steps=2000, lr=1e-3, gamma=0.99):
+def train_dqn(env:GridWorld, steps=2000, lr=1e-3, gamma=0.99, tau: float = 0.01, td_clip: float = 10.0):
     device='cuda' if torch.cuda.is_available() else 'cpu'
-    dqn=DQN(env).to(device); opt=torch.optim.Adam(dqn.parameters(), lr=lr)
+    dqn=DQN(env).to(device)
+    target = DQN(env).to(device)
+    target.load_state_dict(dqn.state_dict())
+    target.eval()
+    opt=torch.optim.Adam(dqn.parameters(), lr=lr)
+    reward_scale = max(1.0, abs(env.cfg.step_cost) + abs(env.cfg.goal_reward))
     s=env.reset()
     for t in range(steps):
         a=dqn.act(s, eps=max(0.01, 1.0 - t/steps))
         s2,r,done,_=env.step(a)
         with torch.no_grad():
-            qn = dqn.forward(s2)
-            y = r + (0.0 if done else gamma*torch.max(qn).item())
-        qsa = dqn.forward(s)[a]
-        loss = F.mse_loss(qsa, torch.tensor(y, device=device).float())
+            r_norm = max(-1.0, min(1.0, float(r) / reward_scale))
+            q_online_next = dqn.forward(s2)
+            best_next = int(torch.argmax(q_online_next).item())
+            q_target_next = target.forward(s2)
+            bootstrap = 0.0 if done else float(q_target_next[best_next].item())
+            target_norm = r_norm + (0.0 if done else gamma * (bootstrap / reward_scale))
+            target_norm = float(np.clip(target_norm, -td_clip, td_clip))
+        qsa = dqn.forward(s)[a] / reward_scale
+        loss = F.smooth_l1_loss(qsa, torch.tensor(target_norm, device=device).float())
         opt.zero_grad(); loss.backward(); clip_grad_norm_(dqn.parameters(), 1.0); opt.step()
+        with torch.no_grad():
+            for tgt_param, param in zip(target.parameters(), dqn.parameters()):
+                tgt_param.data.lerp_(param.data, tau)
         s = env.reset() if done else s2
     return dqn
 
