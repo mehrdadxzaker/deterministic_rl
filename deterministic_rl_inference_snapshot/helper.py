@@ -537,7 +537,7 @@ class QDIN(nn.Module):
         self.h_explic = nn.Linear(hidden, 1)
         self.log_explic_temp = nn.Parameter(torch.zeros(1))
 
-        for head in [self.h_value, self.h_q, self.h_explic]:
+        for head in [self.h_value, self.h_q_value, self.h_q_adv, self.h_explic]:
             nn.init.normal_(head.weight, mean=0.0, std=0.01)
             nn.init.constant_(head.bias, 0.0)
 
